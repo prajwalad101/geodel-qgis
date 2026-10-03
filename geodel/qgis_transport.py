@@ -1,18 +1,20 @@
 """Blocking native QGIS HTTP, called only from plugin background tasks.
 
 QGIS's blocking helper replaces cache attributes and rebuilds redirect requests.
-A process-lifetime preprocessor, installed on module import on the GUI thread,
-restores policy only inside this thread's request scope. It retains no keys
-between calls and leaves every other QGIS request untouched. Registering and
+Reload-safe process-lifetime hooks, installed on the GUI thread,
+restore policy only inside this thread's request scope. They retain no keys
+between calls and leave every other QGIS request untouched. Registering and
 removing QGIS's global preprocessor list from concurrent workers is unsafe.
 """
+from dataclasses import dataclass
 import json as json_codec
 from threading import local
 from time import monotonic
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from urllib.parse import urlencode
 
 from qgis.PyQt.QtCore import QByteArray, QThread, QTimer, QUrl
-from qgis.PyQt.QtNetwork import QNetworkRequest
+from qgis.PyQt.QtNetwork import QNetworkRequest, QSslError
 from qgis.core import (
     QgsApplication, QgsBlockingNetworkRequest, QgsFeedback, QgsNetworkAccessManager,
 )
@@ -20,7 +22,6 @@ from qgis.core import (
 from .transport import Response, TransportCanceled, TransportError, TransportTimeout
 
 
-_request_scope = local()
 _CREDENTIAL_HEADERS = ("Authorization", "X-Organization-Id", "X-Plugin-Version")
 
 
@@ -29,44 +30,100 @@ def _origin(url):
             url.port(443 if url.scheme().lower() == "https" else 80))
 
 
+@dataclass
+class _RequestPolicy:
+    url: QUrl
+    origin: Tuple[str, str, int]
+    headers: Dict[str, str]
+    authenticated: bool
+    hops: int = 0
+    blocked: bool = False
+
+
 def _prepare_request(request):
     policy = getattr(_request_scope, "policy", None)
     if policy is None:
         return
-    url = policy["url"].resolved(request.url())
-    policy["hops"] += 1
+    url = policy.url.resolved(request.url())
+    policy.hops += 1
     if (
-        policy["hops"] > 6
+        policy.hops > 6
         or url.scheme().lower() not in ("http", "https")
         or url.userName() or url.password()
-        or (policy["url"].scheme().lower() == "https" and url.scheme().lower() != "https")
-        or (policy["authenticated"] and _origin(url) != policy["origin"])
+        or (policy.url.scheme().lower() == "https" and url.scheme().lower() != "https")
+        or (policy.authenticated and _origin(url) != policy.origin)
     ):
-        policy["blocked"] = True
+        policy.blocked = True
         # Refuse before sending any bytes; no unsafe redirect or credential log.
         request.setUrl(QUrl())
         for header in _CREDENTIAL_HEADERS:
             request.setRawHeader(header.encode(), QByteArray())
         return
     request.setUrl(url)
-    policy["url"] = url
+    policy.url = url
     for header in _CREDENTIAL_HEADERS:
         request.setRawHeader(header.encode(), QByteArray())
-    for header, value in policy["headers"].items():
+    for header, value in policy.headers.items():
         request.setRawHeader(header.encode(), value.encode())
     request.setAttribute(QNetworkRequest.Attribute.CacheLoadControlAttribute,
                          QNetworkRequest.CacheLoadControl.AlwaysNetwork)
     request.setAttribute(QNetworkRequest.Attribute.CacheSaveControlAttribute, False)
-    # API keys authenticate GeoDel; never reuse cached HTTP auth or cookies.
+    # Allow QGIS's configured proxy credentials. Qt's Manual authentication
+    # flag also disables proxy retries; prior origin auth is cleared below.
     request.setAttribute(QNetworkRequest.Attribute.AuthenticationReuseAttribute,
-                         QNetworkRequest.LoadControl.Manual)
+                         QNetworkRequest.LoadControl.Automatic)
     request.setAttribute(QNetworkRequest.Attribute.CookieLoadControlAttribute,
                          QNetworkRequest.LoadControl.Manual)
     request.setAttribute(QNetworkRequest.Attribute.CookieSaveControlAttribute,
                          QNetworkRequest.LoadControl.Manual)
 
 
-_policy_preprocessor = QgsNetworkAccessManager.setRequestPreprocessor(_prepare_request)
+def _prepare_reply(_request, reply):
+    if getattr(_request_scope, "policy", None) is not None:
+        # Keep Qt's certificate verification, but don't invoke QGIS's modal SSL
+        # handler: it locks this worker on a GUI semaphore and defeats deadlines.
+        # QGIS has already applied the profile's CA and TLS configuration.
+        reply.sslErrors.disconnect()
+        host_port = f"{reply.url().host()}:{reply.url().port(443)}"
+        config = QgsApplication.authManager().sslCertCustomConfigByHost(host_port)
+        if not config.isNull():
+            # These QSslErrors include the saved certificate: Qt only accepts
+            # matching per-host, per-certificate exceptions chosen by the user.
+            # All other certificate errors still fail without a dialog.
+            allowed_errors = [
+                QSslError(error, config.sslCertificate())
+                for error in config.sslIgnoredErrorEnums()
+            ]
+            if allowed_errors:
+                reply.ignoreSslErrors(allowed_errors)
+
+
+# QGIS deletes plugin modules on unload, but retains its preprocessors. Store
+# shared scope and dispatchers on the stable main-thread NAM wrapper so reload
+# updates behavior without accumulating callbacks or dropping active cleanup.
+class _PolicyHooks:
+    def __init__(self):
+        self.scope = local()
+        self.prepare_request = _prepare_request
+        self.prepare_reply = _prepare_reply
+        self.request_identifier = ""
+        self.reply_identifier = ""
+
+
+_policy_owner = QgsNetworkAccessManager.instance()
+_hooks = getattr(_policy_owner, "_geodel_network_hooks", None)
+if _hooks is None:
+    _hooks = _PolicyHooks()
+    _policy_owner._geodel_network_hooks = _hooks
+_request_scope = _hooks.scope
+_hooks.prepare_request = _prepare_request
+_hooks.prepare_reply = _prepare_reply
+if not _hooks.request_identifier:
+    _hooks.request_identifier = QgsNetworkAccessManager.setRequestPreprocessor(
+        lambda request, hooks=_hooks: hooks.prepare_request(request))
+if not _hooks.reply_identifier:
+    _hooks.reply_identifier = QgsNetworkAccessManager.setReplyPreprocessor(
+        lambda request, reply, hooks=_hooks: hooks.prepare_reply(request, reply))
 
 
 class QgisTransport:
@@ -85,7 +142,6 @@ class QgisTransport:
             raise TransportCanceled("Request canceled")
         if method not in ("GET", "POST", "PUT", "DELETE"):
             raise TransportError("Unsupported HTTP method")
-        from urllib.parse import urlencode
         if params:
             url += ("&" if "?" in url else "?") + urlencode(params, doseq=True)
         request_url = QUrl(url)
@@ -93,11 +149,11 @@ class QgisTransport:
         if json is not None:
             data = json_codec.dumps(json).encode("utf-8")
             request_headers["Content-Type"] = "application/json"
-        policy = {
-            "url": request_url, "origin": _origin(request_url),
-            "headers": request_headers, "hops": 0, "blocked": False,
-            "authenticated": any(name in request_headers for name in _CREDENTIAL_HEADERS),
-        }
+        policy = _RequestPolicy(
+            request_url, _origin(request_url), request_headers,
+            any(name.lower() in {header.lower() for header in _CREDENTIAL_HEADERS}
+                for name in request_headers),
+        )
         request = QNetworkRequest(request_url)
         feedback = QgsFeedback()
         blocking = QgsBlockingNetworkRequest()
@@ -113,6 +169,14 @@ class QgisTransport:
             if canceled or expired:
                 feedback.cancel()
 
+        manager = QgsNetworkAccessManager.instance()
+        # Never inherit another request's HTTP authentication, including on
+        # signed storage. QGIS's configured proxy credentials are unaffected.
+        manager.clearAccessCache()
+        # This worker's NAM is shared only by operations on this thread. Avoid
+        # modal HTTP/proxy-auth dialogs; configured proxy credentials still
+        # come from QGIS. Other threads' managers and settings stay untouched.
+        signals_blocked = manager.blockSignals(True)
         timer.setInterval(25)
         timer.timeout.connect(check_request)
         _request_scope.policy = policy
@@ -131,7 +195,7 @@ class QgisTransport:
                 raise TransportCanceled("Request canceled")
             if expired or monotonic() >= deadline or code == QgsBlockingNetworkRequest.ErrorCode.TimeoutError:
                 raise TransportTimeout("Request timed out")
-            if policy["blocked"]:
+            if policy.blocked:
                 raise TransportError("Unsafe or excessive redirect")
             reply = blocking.reply()
             status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
@@ -149,3 +213,4 @@ class QgisTransport:
             # QGIS connects feedback to its helper internally. Release all slots.
             feedback.canceled.disconnect()
             del _request_scope.policy
+            manager.blockSignals(signals_blocked)

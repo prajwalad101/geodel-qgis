@@ -79,7 +79,9 @@ Authenticated responses bypass cache. API redirects may stay on the same
 origin; cross-origin API redirects and HTTPS downgrades are refused. Signed
 storage requests and their redirects never carry GeoDel authentication,
 organization, or plugin-version headers. Request failures contain no submitted
-Personal API Key.
+Personal API Key. Configure trusted certificates and proxy credentials in
+QGIS settings; background requests fail without interactive TLS or HTTP login
+prompts so their deadlines and cancellation remain effective.
 
 Install `dist/geodel.zip` through **Plugins → Manage and Install Plugins →
 Install from ZIP**. Open GeoDel from **Web → GeoDel** or its Web toolbar icon, choose **Open API Key

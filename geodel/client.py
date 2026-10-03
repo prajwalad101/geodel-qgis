@@ -120,6 +120,7 @@ class GeoDelClient:
         progress: Optional[Callable[[float], None]] = None,
         is_canceled: Optional[Callable[[], bool]] = None,
     ) -> str:
+        is_canceled = is_canceled or self.is_canceled
         path = Path(path)
         try:
             file_stat = path.stat()
@@ -136,7 +137,6 @@ class GeoDelClient:
         if is_canceled and is_canceled():
             raise UploadCanceled("Upload canceled")
 
-        is_canceled = is_canceled or self.is_canceled
         initialized = self._request(
             "POST",
             "/uploads/s3/multipart",
@@ -232,6 +232,7 @@ class GeoDelClient:
         progress: Optional[Callable[[float], None]] = None,
         is_canceled: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
+        is_canceled = is_canceled or self.is_canceled
         upload_id = self.upload_file(
             path,
             filename,

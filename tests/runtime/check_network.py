@@ -1,6 +1,7 @@
 """Native transport tests against local fixtures; no external network required."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import sys
 import time
 from threading import Thread
 import unittest
@@ -16,6 +17,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.server.received.append((self.command, self.path, {name.lower(): value for name, value in self.headers.items()},
                                      self.rfile.read(int(self.headers.get("Content-Length", 0)))))
+        if getattr(self.server, "proxy_auth", False) and not self.headers.get("Proxy-Authorization"):
+            self.send_response(407)
+            self.send_header("Proxy-Authenticate", 'Basic realm="local-proxy"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if getattr(self.server, "auth_challenge", False) and not self.headers.get("Authorization"):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="local-origin"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path.startswith("/redirect"):
             self.send_response(307)
             self.send_header("Location", self.server.redirect_url)
@@ -197,13 +210,51 @@ class NetworkRuntimeTests(unittest.TestCase):
         context.load_cert_chain(certificate, key)
         secure = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         secure.received = []
+        secure.status = 200
+        secure.body = b'{}'
         secure.socket = context.wrap_socket(secure.socket, server_side=True)
         Thread(target=secure.serve_forever, daemon=True).start()
         try:
-            with self.assertRaises(TransportError):
-                self.in_task(lambda _task: QgisTransport().request(
-                    "GET", f"https://localhost:{secure.server_port}", timeout=1))
+            from qgis.core import QgsNetworkAccessManager
+            from qgis.PyQt.QtCore import Qt
+            prompts = []
+            def operation(_task):
+                manager = QgsNetworkAccessManager.instance()
+                def pending_dialog(*_args):
+                    prompts.append(True)
+                    time.sleep(0.5)
+                manager.sslErrorsOccurred.connect(pending_dialog, Qt.ConnectionType.DirectConnection)
+                started = time.monotonic()
+                try:
+                    with self.assertRaises(TransportError):
+                        QgisTransport().request("GET", f"https://localhost:{secure.server_port}", timeout=0.1)
+                    self.assertLess(time.monotonic() - started, 0.4)
+                finally:
+                    manager.sslErrorsOccurred.disconnect(pending_dialog)
+            self.in_task(operation)
+            self.assertEqual(prompts, [], "Background requests must never wait for a TLS dialog")
             self.assertEqual(secure.received, [])
+            from qgis.core import QgsAuthCertUtils, QgsAuthConfigSslServer
+            from qgis.PyQt.QtNetwork import QSslCertificate, QSslError
+            certificate_object = QSslCertificate.fromPath(str(certificate))[0]
+            config = QgsAuthConfigSslServer()
+            config.setSslCertificate(certificate_object)
+            host_port = f"localhost:{secure.server_port}"
+            config.setSslHostPort(host_port)
+            config.setSslIgnoredErrorEnums([QSslError.SslError.SelfSignedCertificate])
+            manager = QgsApplication.authManager()
+            self.assertTrue(manager.storeSslCertCustomConfig(config))
+            try:
+                response = self.in_task(lambda _task: QgisTransport().request(
+                    "GET", "https://" + host_port, timeout=1))
+                self.assertEqual(response.status_code, 200)
+                # The saved exception does not disable verification on another host.
+                with self.assertRaises(TransportError):
+                    self.in_task(lambda _task: QgisTransport().request(
+                        "GET", f"https://127.0.0.1:{secure.server_port}", timeout=1))
+            finally:
+                manager.removeSslCertCustomConfig(
+                    QgsAuthCertUtils.shaHexForCert(certificate_object), host_port)
         finally:
             secure.shutdown()
             secure.server_close()
@@ -217,9 +268,11 @@ class NetworkRuntimeTests(unittest.TestCase):
         values = {
             "proxyEnabled": True, "proxyHost": "127.0.0.1",
             "proxyPort": str(self.server.server_port), "proxyType": "HttpProxy",
+            "proxyUser": "fixture-user", "proxyPassword": "fixture-password",
         }
         modern_names = {"proxyEnabled": "proxy-enabled", "proxyHost": "proxy-host",
-                        "proxyPort": "proxy-port", "proxyType": "proxy-type"}
+                        "proxyPort": "proxy-port", "proxyType": "proxy-type",
+                        "proxyUser": "proxy-user", "proxyPassword": "proxy-password"}
         restore = []
         for name, value in values.items():
             if Qgis.QGIS_VERSION_INT >= 40000:
@@ -230,6 +283,7 @@ class NetworkRuntimeTests(unittest.TestCase):
                 key = "proxy/" + name
                 restore.append((key, settings.value(key)))
                 settings.setValue(key, value)
+        self.server.proxy_auth = True
         original_timeout = QgsNetworkAccessManager.timeout()
         def operation(_task):
             manager = QgsNetworkAccessManager.instance()
@@ -241,7 +295,9 @@ class NetworkRuntimeTests(unittest.TestCase):
                     QNetworkProxy(QNetworkProxy.ProxyType.NoProxy), [], [])
         try:
             self.assertEqual(self.in_task(operation).status_code, 200)
-            self.assertEqual(self.server.received[0][1], "http://fixture.invalid/api/v1/organizations")
+            self.assertEqual(self.server.received[-1][1], "http://fixture.invalid/api/v1/organizations")
+            self.assertEqual(self.server.received[-1][2]["proxy-authorization"],
+                             "Basic Zml4dHVyZS11c2VyOmZpeHR1cmUtcGFzc3dvcmQ=")
             self.assertEqual(QgsNetworkAccessManager.timeout(), original_timeout)
         finally:
             for target, value in restore:
@@ -325,3 +381,61 @@ class NetworkRuntimeTests(unittest.TestCase):
             self.assertEqual(self.server.received[-1][2]["authorization"], "Bearer synthetic-key")
             self.assertNotIn("authorization", self.server.received[2][2])
             self.assertEqual(self.server.received[2][3], source.read_bytes())
+
+    def test_module_reload_keeps_single_network_policy_registration(self):
+        import importlib
+        from unittest.mock import patch
+        from qgis.core import QgsNetworkAccessManager
+        import geodel.qgis_transport as module
+        old_transport = module.QgisTransport()
+        original = QgsNetworkAccessManager.setRequestPreprocessor
+        original_reply = QgsNetworkAccessManager.setReplyPreprocessor
+        with patch.object(QgsNetworkAccessManager, "setRequestPreprocessor", wraps=original) as register, \
+                patch.object(QgsNetworkAccessManager, "setReplyPreprocessor", wraps=original_reply) as register_reply:
+            for _ in range(3):
+                sys.modules.pop("geodel.qgis_transport")
+                module = importlib.import_module("geodel.qgis_transport")
+            self.assertEqual(register.call_count, 0)
+            self.assertEqual(register_reply.call_count, 0)
+        self.in_task(lambda _task: old_transport.request("DELETE", self.url + "/old-cleanup",
+                                                       headers={"Authorization": "Bearer synthetic-key"}))
+        self.server.redirect_url = "/destination"
+        self.in_task(lambda _task: module.QgisTransport().request(
+            "GET", self.url + "/redirect", headers={"Authorization": "Bearer synthetic-key"}))
+        self.assertEqual(self.server.received[-1][2]["authorization"], "Bearer synthetic-key")
+
+    def test_cached_origin_credentials_never_reach_storage_or_open_login_dialog(self):
+        from qgis.core import QgsBlockingNetworkRequest, QgsNetworkAccessManager
+        from qgis.PyQt.QtCore import QUrl, Qt
+        from qgis.PyQt.QtNetwork import QNetworkRequest
+        from geodel.qgis_transport import QgisTransport
+        self.server.auth_challenge = True
+        def operation(_task):
+            manager = QgsNetworkAccessManager.instance()
+            def authorize(_reply, authenticator):
+                authenticator.setUser("fixture-user")
+                authenticator.setPassword("synthetic-key")
+            manager.authenticationRequired.connect(authorize, Qt.ConnectionType.DirectConnection)
+            try:
+                seed = QgsBlockingNetworkRequest()
+                seed.get(QNetworkRequest(QUrl(self.url)), True)
+                self.assertEqual(seed.reply().attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute), 200)
+            finally:
+                manager.authenticationRequired.disconnect(authorize)
+            prompts = []
+            def unexpected_prompt(*_args):
+                prompts.append(True)
+                time.sleep(0.5)
+            manager.requestRequiresAuth.connect(unexpected_prompt, Qt.ConnectionType.DirectConnection)
+            started = time.monotonic()
+            try:
+                response = QgisTransport().request("PUT", self.url + "/storage", data=b"bytes", timeout=0.1)
+                self.assertEqual(response.status_code, 401)
+                self.assertLess(time.monotonic() - started, 0.4)
+                self.assertFalse(manager.signalsBlocked())
+                self.assertEqual(prompts, [])
+            finally:
+                manager.requestRequiresAuth.disconnect(unexpected_prompt)
+        self.in_task(operation)
+        self.assertIn("authorization", self.server.received[-2][2])
+        self.assertNotIn("authorization", self.server.received[-1][2])
