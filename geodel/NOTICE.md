@@ -1,0 +1,13 @@
+# Copyright and resources
+
+GeoDel QGIS Plugin: Copyright (C) 2026 GeoDel contributors.
+Code, tests, scripts, documentation, and the original globe drawing in
+`icon.svg` are distributed under GPL-3.0-or-later; see LICENSE.
+The icon was drawn for this standalone snapshot from SVG geometric primitives.
+It replaces an earlier web application logo whose resource licensing was
+not documented. No third-party artwork or datasets are bundled.
+
+QGIS and Qt are supplied by the user's QGIS installation; requests and its
+transitive dependencies are installed separately. They are not bundled or
+relicensed by this repository. Their respective licenses continue to apply.
+GeoDel is the product name; this license does not grant trademark rights.

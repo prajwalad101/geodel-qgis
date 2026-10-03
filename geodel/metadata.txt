@@ -1,0 +1,15 @@
+[general]
+name=GeoDel
+description=Upload and share GIS data without leaving QGIS.
+version=0.1.0
+qgisMinimumVersion=3.44
+qgisMaximumVersion=4.99
+author=GeoDel
+email=hello@geodel.app
+about=Connect QGIS to GeoDel with a personal API key. Requires the requests Python package; see the repository README for setup.
+tracker=https://github.com/prajwalad101/geodel-qgis/issues
+repository=https://github.com/prajwalad101/geodel-qgis
+homepage=https://geodel.app
+category=Web
+icon=icon.svg
+experimental=True
