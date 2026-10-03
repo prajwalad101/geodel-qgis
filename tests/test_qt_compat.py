@@ -31,7 +31,8 @@ def test_toolbar_and_metadata_use_packaged_icon():
 
 
 def _plugin_method(class_name, method_name, globals_=None):
-    tree = ast.parse(PLUGIN_PATH.read_text())
+    source = PLUGIN_PATH.with_name("dock.py") if class_name == "GeoDelDockWidget" else PLUGIN_PATH
+    tree = ast.parse(source.read_text())
     owner = next(
         node
         for node in tree.body

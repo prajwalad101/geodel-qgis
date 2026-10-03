@@ -16,5 +16,5 @@ def cancel_task(task):
 def disconnect_signal(signal, callback):
     try:
         signal.disconnect(callback)
-    except TypeError:
+    except (TypeError, RuntimeError):
         pass

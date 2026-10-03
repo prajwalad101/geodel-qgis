@@ -11,8 +11,10 @@ Follow README setup, run `.venv/bin/python -m pytest`, compile Python with
 `python3 scripts/build.py`. Keep tests and support files outside `geodel/`.
 When adding a package file, update the build allowlist in `scripts/build.py`.
 Test user-facing behavior; keep fixtures synthetic and independent of services.
-Changes affecting QGIS integration also need the manual checklist on QGIS 3.44
-and latest stable. Record version, OS, date, and actual outcomes.
+Changes affecting QGIS integration must pass the real-runtime tests on QGIS
+3.44/Qt5 and 4.2/Qt6 and the official Qt6 checker; see README for commands.
+The owner completes the manual checklist before releases on QGIS 3.44 and
+latest stable, recording version, OS, date, and actual outcomes.
 
 Never commit secrets, real customer datasets, credential stores, profiles,
 generated ZIPs, or dependencies. Preserve copyright and license notices.

@@ -7,7 +7,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 PACKAGE_FILES = (
     "__init__.py", "auth_compat.py", "client.py", "config.py", "icon.svg",
     "layer_export.py", "LICENSE", "metadata.txt", "NOTICE.md", "plugin.py",
-    "recent_upload.py", "task_lifecycle.py",
+    "recent_upload.py", "task_lifecycle.py", "dock.py", "tasks.py", "metadata.py",
 )
 
 

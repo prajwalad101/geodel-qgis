@@ -19,9 +19,43 @@ python3 scripts/build.py
 
 On Windows, use `py` instead of `python3` and `.venv\Scripts\python.exe`
 instead of `.venv/bin/python`. Development dependencies and their transitive
-dependencies are pinned in `requirements-dev.txt`. The 40 behavior tests use
+dependencies are pinned in `requirements-dev.txt`. The behavior tests use
 synthetic fixtures and QGIS doubles; they do not need QGIS, network access,
-or any other repository. They do not replace runtime checks in QGIS.
+or any other repository. QGIS integration tests run separately in real QGIS/Qt runtimes. They use a
+small interface host backed by real Qt menus, toolbar, dock widgets, QGIS tasks
+and Authentication Manager; only service responses are synthetic. They cover
+entry-point loading, repeated GUI initialization, open/close, unload/reload,
+cancellation and late callbacks, encrypted key replacement, and share-link copy.
+
+CI runs QGIS 3.44 with Qt5 and QGIS 4.2 with Qt6 using pinned official container
+images. Each run has a disposable home, settings profile and authentication
+store, disables the password helper through QGIS's API, and disables container
+network access. It never touches your QGIS profile or operating-system keychain.
+Run locally with Docker (add `--platform linux/amd64` on Apple Silicon):
+
+```sh
+docker run --rm --network none --entrypoint python3 \
+  -v "$PWD:/workspace:ro" -w /workspace \
+  -e GEODEL_EXPECT_QGIS=3.44 -e GEODEL_EXPECT_QT=5 \
+  qgis/qgis@sha256:bacafbaf899bb2af5d99dd8a138e0438733aac252ddd5f29d089ad34641bb059 \
+  scripts/test-qgis.py
+
+docker run --rm --network none --entrypoint python3 \
+  -v "$PWD:/workspace:ro" -w /workspace \
+  -e GEODEL_EXPECT_QGIS=4.2 -e GEODEL_EXPECT_QT=6 \
+  qgis/qgis@sha256:8996496c15887a8fae0da05fa38103093ddbf104525bcbd67bf733a914fb1444 \
+  scripts/test-qgis.py
+
+docker run --rm --network none --entrypoint python3 \
+  -v "$PWD:/workspace:ro" -w /workspace \
+  ghcr.io/qgis/pyqgis4-checker@sha256:c96df111845eb0c86ad56364fb792d35fa6931e01d3d629d2b1bc6388ed43ece \
+  scripts/check-qt6.py
+```
+
+The official checker runs in dry-run mode; its report is checked for findings
+because its exit status alone does not indicate compatibility. See the
+[QGIS migration guidance](https://github.com/qgis/QGIS/wiki/Plugin-migration-to-be-compatible-with-Qt5-and-Qt6).
+Runtime tests supplement the owner's manual release checklist.
 
 `geodel/` is the installable Python package. Tests, scripts, and documentation
 live outside it. The build script includes only the audited package files in
@@ -38,7 +72,7 @@ QGIS supplies the `qgis` and `qgis.PyQt` modules; do not install separate Qt
 bindings into the plugin.
 
 Install `dist/geodel.zip` through **Plugins → Manage and Install Plugins →
-Install from ZIP**. Open GeoDel from its toolbar icon, choose **Open API Key
+Install from ZIP**. Open GeoDel from **Web → GeoDel** or its Web toolbar icon, choose **Open API Key
 Setup**, create and copy a Personal API Key, then paste it into the panel and
 choose **Save and connect**. GeoDel validates the key before unlocking
 operations. The key is encrypted by QGIS Authentication Manager. The

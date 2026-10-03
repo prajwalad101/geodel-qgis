@@ -1,0 +1,49 @@
+name: Plugin tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  behavior:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest
+      - run: python -m compileall -q geodel scripts tests
+      - run: python scripts/build.py
+  qgis-runtime:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - qgis: '3.44'
+            qt: '5'
+            image: qgis/qgis@sha256:bacafbaf899bb2af5d99dd8a138e0438733aac252ddd5f29d089ad34641bb059
+          - qgis: '4.2'
+            qt: '6'
+            image: qgis/qgis@sha256:8996496c15887a8fae0da05fa38103093ddbf104525bcbd67bf733a914fb1444
+    steps:
+      - uses: actions/checkout@v4
+      - name: Real QGIS, Qt and Authentication Manager tests
+        run: >-
+          docker run --rm --network none --entrypoint python3
+          -v "$PWD:/workspace:ro" -w /workspace
+          -e GEODEL_EXPECT_QGIS=${{ matrix.qgis }}
+          -e GEODEL_EXPECT_QT=${{ matrix.qt }}
+          ${{ matrix.image }} scripts/test-qgis.py
+  qt6-checker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Official QGIS Qt6 compatibility checker
+        run: >-
+          docker run --rm --network none --entrypoint python3
+          -v "$PWD:/workspace:ro" -w /workspace
+          ghcr.io/qgis/pyqgis4-checker@sha256:c96df111845eb0c86ad56364fb792d35fa6931e01d3d629d2b1bc6388ed43ece
+          scripts/check-qt6.py
