@@ -7,6 +7,8 @@ permissions:
 jobs:
   behavior:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -14,8 +16,32 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m pytest
+      - run: python -m mypy --check-untyped-defs scripts/build.py scripts/validate_package.py scripts/scan.py
       - run: python -m compileall -q geodel scripts tests
-      - run: python scripts/build.py
+      - name: Scan source
+        run: python scripts/scan.py geodel
+      - id: version
+        run: |
+          version=$(python -c 'from geodel.metadata import PLUGIN_VERSION; print(PLUGIN_VERSION)')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Build and validate committed package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python scripts/build.py
+          python scripts/validate_package.py "dist/geodel-$VERSION.zip" --commit "$GITHUB_SHA"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            python scripts/validate_package.py "dist/geodel-$VERSION.zip" --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
+          fi
+          python -m zipfile -e "dist/geodel-$VERSION.zip" extracted
+          python scripts/scan.py extracted/geodel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-${{ github.sha }}
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
   qgis-runtime:
     runs-on: ubuntu-latest
     strategy:
@@ -30,20 +56,72 @@ jobs:
             image: qgis/qgis@sha256:8996496c15887a8fae0da05fa38103093ddbf104525bcbd67bf733a914fb1444
     steps:
       - uses: actions/checkout@v4
-      - name: Real QGIS, Qt and Authentication Manager tests
-        run: >-
-          docker run --rm --network none --entrypoint python3
-          -v "$PWD:/workspace:ro" -w /workspace
-          -e GEODEL_EXPECT_QGIS=${{ matrix.qgis }}
-          -e GEODEL_EXPECT_QT=${{ matrix.qt }}
-          ${{ matrix.image }} scripts/test-qgis.py
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python scripts/build.py
+      - run: python -m zipfile -e dist/geodel-*.zip extracted
+      - name: Real QGIS tests on source and extracted package
+        env:
+          QGIS_IMAGE: ${{ matrix.image }}
+          EXPECT_QGIS: ${{ matrix.qgis }}
+          EXPECT_QT: ${{ matrix.qt }}
+        run: |
+          for package in /workspace /workspace/extracted; do
+            docker run --rm --network none --entrypoint python3 \
+              -v "$PWD:/workspace:ro" -w /workspace \
+              -e GEODEL_PACKAGE_ROOT="$package" \
+              -e GEODEL_EXPECT_QGIS="$EXPECT_QGIS" -e GEODEL_EXPECT_QT="$EXPECT_QT" \
+              "$QGIS_IMAGE" scripts/test-qgis.py
+          done
   qt6-checker:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Official QGIS Qt6 compatibility checker
-        run: >-
-          docker run --rm --network none --entrypoint python3
-          -v "$PWD:/workspace:ro" -w /workspace
-          ghcr.io/qgis/pyqgis4-checker@sha256:c96df111845eb0c86ad56364fb792d35fa6931e01d3d629d2b1bc6388ed43ece
-          scripts/check-qt6.py
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python scripts/build.py
+      - run: python -m zipfile -e dist/geodel-*.zip extracted
+      - name: Official Qt6 checker on source and extracted package
+        run: |
+          for package in geodel extracted/geodel; do
+            docker run --rm --network none --entrypoint python3 \
+              -v "$PWD:/workspace:ro" -w /workspace \
+              ghcr.io/qgis/pyqgis4-checker@sha256:c96df111845eb0c86ad56364fb792d35fa6931e01d3d629d2b1bc6388ed43ece \
+              scripts/check-qt6.py "$package"
+          done
+  draft-release:
+    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'prajwalad101/geodel-qgis'
+    needs: [behavior, qgis-runtime, qt6-checker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: draft-release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-${{ github.sha }}
+          path: dist
+      - name: Verify same-run artifact, tag and main before draft upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.behavior.outputs.version }}
+        run: |
+          git fetch origin main "refs/tags/$GITHUB_REF_NAME"
+          test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          python scripts/validate_package.py "dist/geodel-$VERSION.zip" --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
+          (cd dist && sha256sum --check "geodel-$VERSION.zip.sha256")
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/geodel-$VERSION.zip" "dist/geodel-$VERSION.zip.sha256" \
+            --verify-tag --draft --title "GeoDel QGIS $VERSION" \
+            --notes-file RELEASE.md

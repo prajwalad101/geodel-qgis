@@ -12,7 +12,9 @@ import time
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, os.environ.get(
+    "GEODEL_PACKAGE_ROOT", str(Path(__file__).resolve().parents[2]),
+))
 
 from qgis.PyQt.QtCore import QCoreApplication, QEvent, QT_VERSION_STR, QTimer
 from qgis.PyQt.QtWidgets import (

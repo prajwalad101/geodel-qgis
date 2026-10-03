@@ -1,6 +1,6 @@
 # GeoDel QGIS plugin
 
-Standalone public home for GeoDel QGIS plugin development. Requires **QGIS
+Standalone home for GeoDel QGIS plugin development. Requires **QGIS
 3.44 or newer**, a GeoDel account, a Workspace, and a Personal API Key for
 live operations. Testing and building require no account or service access.
 
@@ -15,6 +15,8 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m pytest
 python3 scripts/build.py
+.venv/bin/python scripts/scan.py geodel
+.venv/bin/python -m mypy scripts/build.py scripts/validate_package.py scripts/scan.py
 ```
 
 On Windows, use `py` instead of `python3` and `.venv\Scripts\python.exe`
@@ -60,10 +62,19 @@ because its exit status alone does not indicate compatibility. See the
 [QGIS migration guidance](https://github.com/qgis/QGIS/wiki/Plugin-migration-to-be-compatible-with-Qt5-and-Qt6).
 Runtime tests supplement the owner's manual release checklist.
 
-`geodel/` is the installable Python package. Tests, scripts, and documentation
-live outside it. The build script includes only the audited package files in
-`dist/geodel.zip`, including the entry point, metadata, license, and resource
+`geodel/` is the installable Python package. Development tests and release scripts live outside it; installable usage docs
+and original sample/assets live inside it. The build script includes only the audited package files in
+`dist/geodel-0.1.1.zip`, including the entry point, metadata, license, and resource
 notices. Generated archives are ignored and must not be committed.
+
+## Usage, requirements and troubleshooting
+
+See [packaged usage guide](geodel/README.md) for setup, screenshots, vector
+upload/share behavior, troubleshooting and data-transfer disclosure. Live use
+requires an account, Workspace, Personal API Key, internet and an active trial
+or subscription. Limits: 20 project vector layers and 60 MiB per upload. Browse
+supports `.zip`, `.geojson` and `.json`. [Synthetic sample](geodel/sample/README.md)
+is included under GPL-3.0-or-later. No extra runtime Python packages needed.
 
 ## QGIS installation and use
 
@@ -83,7 +94,7 @@ Personal API Key. Configure trusted certificates and proxy credentials in
 QGIS settings; background requests fail without interactive TLS or HTTP login
 prompts so their deadlines and cancellation remain effective.
 
-Install `dist/geodel.zip` through **Plugins → Manage and Install Plugins →
+Install `dist/geodel-0.1.1.zip` through **Plugins → Manage and Install Plugins →
 Install from ZIP**. Open GeoDel from **Web → GeoDel** or its Web toolbar icon, choose **Open API Key
 Setup**, create and copy a Personal API Key, then paste it into the panel and
 choose **Save and connect**. GeoDel validates the key before unlocking
@@ -105,9 +116,14 @@ with failed-layer and health-warning summaries linking to the web app.
 
 The plugin reads its product name, API URL, and website URL from
 `geodel/config.py`. For a local service, set `API_URL` to
-`http://localhost:4000` and `WEB_URL` to `http://localhost:3000`, then rebuild.
-The ZIP includes this file: restore production URLs before sharing a build.
-Never commit Personal API Keys, QGIS profiles, customer data, or signed URLs.
+`http://localhost:4000` and `WEB_URL` to `http://localhost:3000`. For this
+development-only setup, copy the `geodel/` directory directly into the Python
+plugins directory of a separate disposable QGIS profile, then restart that
+profile. Release builds reject local URLs; restore production URLs before
+building or sharing a candidate. Never use your normal credential profile for
+local service testing.
+Release validation rejects development service URLs. Never commit Personal API
+Keys, QGIS profiles, customer data, or signed URLs.
 
 ## Contributions and releases
 
@@ -117,20 +133,9 @@ here. Service/API changes require coordination with GeoDel service maintainers.
 The service owns its API contract and minimum supported plugin version;
 repository extraction does not change either.
 
-Before a release, complete [MANUAL_TEST_CHECKLIST.md](MANUAL_TEST_CHECKLIST.md)
-on QGIS 3.44 and the latest stable QGIS release and record actual results.
-From a clean `main` commit with matching `geodel/metadata.txt` version and
-standalone `origin`, maintainers may run:
-
-```sh
-scripts/release.sh 0.1.0
-```
-
-This tests, builds the local ZIP, and atomically pushes the standalone source
-and annotated version tag. It does not create a GitHub release or submit to
-QGIS. No release or QGIS submission was made for this extraction. Public source,
-license, and resource requirements are documented by
-[QGIS](https://plugins.qgis.org/docs/publish).
+See [RELEASE.md](RELEASE.md) for reproducible candidate verification, CI gates,
+tag-based draft packaging and owner publication/submission steps. No manual
+platform test or QGIS acceptance is claimed. Current candidate is 0.1.1.
 
 ## License
 

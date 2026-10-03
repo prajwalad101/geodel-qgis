@@ -1,0 +1,1 @@
+{"type":"FeatureCollection","name":"Synthetic places","features":[{"type":"Feature","properties":{"name":"Demo west","kind":"synthetic"},"geometry":{"type":"Point","coordinates":[85.30,27.70]}},{"type":"Feature","properties":{"name":"Demo east","kind":"synthetic"},"geometry":{"type":"Point","coordinates":[85.32,27.71]}}]}

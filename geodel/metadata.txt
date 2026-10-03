@@ -1,15 +1,17 @@
 [general]
 name=GeoDel
 description=Upload and share GIS data without leaving QGIS.
-version=0.1.0
+version=0.1.1
 qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 author=GeoDel
 email=hello@geodel.app
-about=Connect QGIS to GeoDel with a personal API key. Uses native QGIS networking and proxy settings; no additional Python packages are required.
+about=Upload project vector layers as EPSG:4326 GeoJSON or zipped Shapefiles and copy share links from GeoDel. Requires a GeoDel account, Workspace, Personal API Key, internet connection, and an active trial or subscription. Supports .geojson, .json and .zip files, up to 20 project layers and 60 MiB per upload. Uses native QGIS networking; no additional runtime Python packages are required.
 tracker=https://github.com/prajwalad101/geodel-qgis/issues
 repository=https://github.com/prajwalad101/geodel-qgis
-homepage=https://geodel.app
+homepage=https://github.com/prajwalad101/geodel-qgis/blob/main/README.md
 category=Web
-icon=icon.svg
-experimental=True
+icon=icon.png
+experimental=False
+tags=data sharing,cloud upload,geojson,shapefile,web maps
+changelog=0.1.1: Native QGIS networking, QGIS 3.44/4 compatibility, stable metadata, documented usage and validated reproducible release packaging.

@@ -27,7 +27,8 @@ def test_toolbar_and_metadata_use_packaged_icon():
     metadata = ConfigParser()
     metadata.read(PLUGIN_PATH.with_name("metadata.txt"))
     assert icon_path == PLUGIN_PATH.with_name(metadata["general"]["icon"])
-    assert ElementTree.parse(icon_path).getroot().tag == "{http://www.w3.org/2000/svg}svg"
+    assert icon_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert ElementTree.parse(icon_path.with_suffix(".svg")).getroot().tag == "{http://www.w3.org/2000/svg}svg"
 
 
 def _plugin_method(class_name, method_name, globals_=None):

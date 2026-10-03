@@ -69,7 +69,7 @@ class GeoDelPlugin:
         if self.action is not None:
             return
         self._lifecycle_version += 1
-        icon = QIcon(str(Path(__file__).with_name("icon.svg")))
+        icon = QIcon(str(Path(__file__).with_name("icon.png")))
         self.action = QAction(icon, PRODUCT_NAME, self.iface.mainWindow())
         self.action.setObjectName("GeoDelAction")
         self.action.setCheckable(True)
@@ -89,11 +89,11 @@ class GeoDelPlugin:
         self._connect(self.dock.layers.itemSelectionChanged, self._layers_changed)
         self._connect(self.dock.browse_button.clicked, self._browse_file)
         self._connect(self.dock.browse_button.file_dropped, self._choose_file, with_arguments=True)
-        self._connect(self.dock.source_layers_button.clicked,
-            lambda: self._source_changed(False)
+        self._connect(
+            self.dock.source_layers_button.clicked, lambda: self._source_changed(False),
         )
-        self._connect(self.dock.source_file_button.clicked,
-            lambda: self._source_changed(True)
+        self._connect(
+            self.dock.source_file_button.clicked, lambda: self._source_changed(True),
         )
         self._connect(self.dock.upload_name.textChanged, self._update_upload_enabled)
         self._connect(self.dock.upload_button.clicked, self._start_upload)

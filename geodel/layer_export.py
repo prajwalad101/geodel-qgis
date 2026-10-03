@@ -152,7 +152,7 @@ def _geojson_has_features(path):
                 if match is None:
                     buffer = buffer[-32:]
                     continue
-                buffer = buffer[match.end() :]
+                buffer = buffer[match.end():]
                 found = True
             content = buffer.lstrip()
             if content:

@@ -183,8 +183,10 @@ class QgisTransport:
         timer.start()
         try:
             if method == "GET":
-                code = blocking.get(request, True, feedback,
-                    QgsBlockingNetworkRequest.RequestFlag.EmptyResponseIsValid)
+                code = blocking.get(
+                    request, True, feedback,
+                    QgsBlockingNetworkRequest.RequestFlag.EmptyResponseIsValid,
+                )
             elif method == "POST":
                 code = blocking.post(request, QByteArray(data or b""), True, feedback)
             elif method == "PUT":

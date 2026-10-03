@@ -9,7 +9,7 @@ assume access to any private repository is needed to contribute here.
 Follow README setup, run `.venv/bin/python -m pytest`, compile Python with
 `.venv/bin/python -m compileall -q geodel scripts tests`, and build with
 `python3 scripts/build.py`. Keep tests and support files outside `geodel/`.
-When adding a package file, update the build allowlist in `scripts/build.py`.
+When adding a package file, update the package allowlist in `scripts/validate_package.py`.
 Test user-facing behavior; keep fixtures synthetic and independent of services.
 Changes affecting QGIS integration must pass the real-runtime tests on QGIS
 3.44/Qt5 and 4.2/Qt6 and the official Qt6 checker; see README for commands.
