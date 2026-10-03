@@ -1,7 +1,8 @@
 from unittest.mock import Mock, patch
 
 import pytest
-import requests
+import json
+from geodel.transport import Response, Transport, TransportError
 
 from geodel.client import (
     MAX_FILE_SIZE,
@@ -16,18 +17,12 @@ from geodel.client import (
 
 
 def response(status_code, payload, headers=None):
-    result = Mock(status_code=status_code, headers=headers or {})
-    result.json.return_value = payload
-    if status_code >= 400:
-        result.raise_for_status.side_effect = requests.HTTPError(
-            f"{status_code} Server Error"
-        )
-    return result
+    return Response(status_code, json.dumps(payload).encode(), headers or {})
 
 
 def test_lists_organizations_with_plugin_auth_headers():
-    session = Mock()
-    session.request.return_value = response(
+    transport = Mock(spec=Transport)
+    transport.request.return_value = response(
         200,
         {"organizations": [{"id": "org-1", "name": "Field Team"}]},
     )
@@ -35,11 +30,11 @@ def test_lists_organizations_with_plugin_auth_headers():
         "https://example.com/",
         "geodel_secret",
         "0.1.0",
-        session=session,
+        transport=transport,
     )
 
     assert client.list_organizations() == [{"id": "org-1", "name": "Field Team"}]
-    session.request.assert_called_once_with(
+    transport.request.assert_called_once_with(
         "GET",
         "https://example.com/api/v1/organizations",
         headers={
@@ -47,17 +42,18 @@ def test_lists_organizations_with_plugin_auth_headers():
             "X-Plugin-Version": "0.1.0",
         },
         timeout=15,
+        is_canceled=None,
     )
 
 
 def test_revoked_key_raises_clear_authentication_error():
-    session = Mock()
-    session.request.return_value = response(401, {"message": "Unauthorized"})
+    transport = Mock(spec=Transport)
+    transport.request.return_value = response(401, {"message": "Unauthorized"})
     client = GeoDelClient(
         "https://example.com",
         "geodel_revoked",
         "0.1.0",
-        session=session,
+        transport=transport,
     )
 
     with pytest.raises(AuthenticationError, match="API key is invalid or revoked"):
@@ -65,13 +61,13 @@ def test_revoked_key_raises_clear_authentication_error():
 
 
 def test_forbidden_response_is_not_reported_as_revoked_key():
-    session = Mock()
-    session.request.return_value = response(403, {"message": "Forbidden"})
+    transport = Mock(spec=Transport)
+    transport.request.return_value = response(403, {"message": "Forbidden"})
     client = GeoDelClient(
         "https://example.com",
         "geodel_valid",
         "0.1.0",
-        session=session,
+        transport=transport,
     )
 
     with pytest.raises(AuthorizationError, match="does not have access"):
@@ -79,13 +75,13 @@ def test_forbidden_response_is_not_reported_as_revoked_key():
 
 
 def test_server_error_uses_http_failure():
-    session = Mock()
-    session.request.return_value = response(500, {"message": "Server error"})
+    transport = Mock(spec=Transport)
+    transport.request.return_value = response(500, {"message": "Server error"})
     client = GeoDelClient(
         "https://example.com",
         "geodel_valid",
         "0.1.0",
-        session=session,
+        transport=transport,
     )
 
     with pytest.raises(GeoDelError) as caught:
@@ -96,13 +92,13 @@ def test_server_error_uses_http_failure():
 
 def test_api_errors_use_configured_product_name(monkeypatch):
     monkeypatch.setattr("geodel.client.PRODUCT_NAME", "Maply")
-    session = Mock()
-    session.request.return_value = response(500, {"message": "Server error"})
+    transport = Mock(spec=Transport)
+    transport.request.return_value = response(500, {"message": "Server error"})
     client = GeoDelClient(
         "https://example.com",
         "geodel_valid",
         "0.1.0",
-        session=session,
+        transport=transport,
     )
 
     with pytest.raises(GeoDelError, match="Maply request failed: Server error"):
@@ -114,19 +110,19 @@ def test_api_errors_use_configured_product_name(monkeypatch):
     [("0.1.0", False), ("0.2.0", True), ("0.1.1", True)],
 )
 def test_meta_version_gate(minimum, requires_update):
-    session = Mock()
-    session.request.return_value = response(
+    transport = Mock(spec=Transport)
+    transport.request.return_value = response(
         200, {"minPluginVersion": minimum, "pluginVersion": "0.1.0"}
     )
     client = GeoDelClient(
         "https://example.com",
         "",
         "0.1.0",
-        session=session,
+        transport=transport,
     )
 
     assert client.requires_update() is requires_update
-    assert "Authorization" not in session.request.call_args.kwargs["headers"]
+    assert "Authorization" not in transport.request.call_args.kwargs["headers"]
 
 
 @pytest.mark.parametrize(
@@ -139,13 +135,13 @@ def test_meta_version_gate(minimum, requires_update):
 def test_version_gate_identifies_invalid_version_source(
     plugin_version, minimum, message
 ):
-    session = Mock()
-    session.request.return_value = response(200, {"minPluginVersion": minimum})
+    transport = Mock(spec=Transport)
+    transport.request.return_value = response(200, {"minPluginVersion": minimum})
     client = GeoDelClient(
         "https://example.com",
         "",
         plugin_version,
-        session=session,
+        transport=transport,
     )
 
     with pytest.raises(GeoDelError, match=message):
@@ -153,8 +149,8 @@ def test_version_gate_identifies_invalid_version_source(
 
 
 def test_lists_folders_for_selected_organization():
-    session = Mock()
-    session.request.return_value = response(
+    transport = Mock(spec=Transport)
+    transport.request.return_value = response(
         200,
         {
             "folders": [
@@ -169,11 +165,11 @@ def test_lists_folders_for_selected_organization():
         "https://example.com",
         "geodel_secret",
         "0.1.0",
-        session=session,
+        transport=transport,
     )
 
     assert client.list_folders("org-1")[0]["name"] == "Projects"
-    assert session.request.call_args.kwargs["headers"]["X-Organization-Id"] == "org-1"
+    assert transport.request.call_args.kwargs["headers"]["X-Organization-Id"] == "org-1"
 
 
 @pytest.mark.parametrize("folder", [
@@ -183,9 +179,9 @@ def test_lists_folders_for_selected_organization():
     {"id": "folder-1", "name": 1},
 ])
 def test_rejects_invalid_folders(folder):
-    session = Mock()
-    session.request.return_value = response(200, {"folders": [folder]})
-    client = GeoDelClient("https://example.com", "key", "0.1.0", session=session)
+    transport = Mock(spec=Transport)
+    transport.request.return_value = response(200, {"folders": [folder]})
+    client = GeoDelClient("https://example.com", "key", "0.1.0", transport=transport)
     with pytest.raises(GeoDelError, match="invalid folders response"):
         client.list_folders("org-1")
 
@@ -209,13 +205,13 @@ def test_lists_recent_uploads_with_owner_summary():
             },
         }
     ]
-    session = Mock()
-    session.request.return_value = response(200, {"uploads": uploads})
+    transport = Mock(spec=Transport)
+    transport.request.return_value = response(200, {"uploads": uploads})
     client = GeoDelClient(
         "https://example.com",
         "geodel_secret",
         "0.1.0",
-        session=session,
+        transport=transport,
     )
 
     projected = client.list_recent_uploads("org-1")[0]
@@ -223,16 +219,16 @@ def test_lists_recent_uploads_with_owner_summary():
     assert projected.failed_layers_tooltip == "water: Could not read geometry"
     assert projected.health_warning_label == "⚠ 2 health warnings"
     assert projected.copy_share_url == "https://example.com/s/share-1"
-    assert session.request.call_args.kwargs["headers"]["X-Organization-Id"] == "org-1"
-    assert session.request.call_args.kwargs["params"] == {"recent": "true"}
+    assert transport.request.call_args.kwargs["headers"]["X-Organization-Id"] == "org-1"
+    assert transport.request.call_args.kwargs["params"] == {"recent": "true"}
 
 
 def test_multipart_upload_sends_original_bytes_and_reports_progress(tmp_path):
     source = tmp_path / "roads.geojson"
     original = b"a" * PART_SIZE + b"last byte"
     source.write_bytes(original)
-    session = Mock()
-    session.request.side_effect = [
+    transport = Mock(spec=Transport)
+    transport.request.side_effect = [
         response(
             200,
             {"attemptId": "attempt-1", "key": "attempt-1", "uploadId": "attempt-1"},
@@ -249,7 +245,7 @@ def test_multipart_upload_sends_original_bytes_and_reports_progress(tmp_path):
         "https://example.com",
         "geodel_secret",
         "0.1.0",
-        session=session,
+        transport=transport,
     )
 
     upload_id = client.upload_file(
@@ -261,16 +257,16 @@ def test_multipart_upload_sends_original_bytes_and_reports_progress(tmp_path):
     )
 
     assert upload_id == "upload-1"
-    assert session.request.call_args_list[2].args == (
+    assert transport.request.call_args_list[2].args == (
         "PUT",
         "https://storage.example.com/part-1",
     )
     uploaded = (
-        session.request.call_args_list[2].kwargs["data"]
-        + session.request.call_args_list[4].kwargs["data"]
+        transport.request.call_args_list[2].kwargs["data"]
+        + transport.request.call_args_list[4].kwargs["data"]
     )
     assert uploaded == original
-    assert session.request.call_args_list[6].kwargs["json"] == {
+    assert transport.request.call_args_list[6].kwargs["json"] == {
         "attemptId": "attempt-1",
         "folderId": "folder-1",
     }
@@ -279,8 +275,8 @@ def test_multipart_upload_sends_original_bytes_and_reports_progress(tmp_path):
 
 
 def test_reads_upload_status_and_share_token():
-    session = Mock()
-    session.request.side_effect = [
+    transport = Mock(spec=Transport)
+    transport.request.side_effect = [
         response(
             200,
             {
@@ -295,7 +291,7 @@ def test_reads_upload_status_and_share_token():
         "https://example.com",
         "geodel_secret",
         "0.1.0",
-        session=session,
+        transport=transport,
     )
 
     assert client.get_upload_status("upload-1", "org-1") == {
@@ -313,7 +309,7 @@ def test_publishes_file_until_share_link_is_ready(tmp_path):
         "https://example.com",
         "geodel_secret",
         "0.1.0",
-        session=Mock(),
+        transport=Mock(spec=Transport),
     )
     client.upload_file = Mock(
         side_effect=lambda *args: (args[4](50), "upload-1")[1]
@@ -346,7 +342,7 @@ def test_publish_retries_transient_status_and_share_link_errors(tmp_path):
         "https://example.com",
         "geodel_secret",
         "0.1.0",
-        session=Mock(),
+        transport=Mock(spec=Transport),
     )
     client.upload_file = Mock(return_value="upload-1")
     processing = {
@@ -381,7 +377,7 @@ def test_publish_cancels_while_waiting_for_processing(tmp_path):
         "https://example.com",
         "geodel_secret",
         "0.1.0",
-        session=Mock(),
+        transport=Mock(spec=Transport),
     )
     client.upload_file = Mock(return_value="upload-1")
     client.get_upload_status = Mock(
@@ -408,7 +404,7 @@ def test_publish_returns_timeout_outcome(tmp_path):
         "https://example.com",
         "geodel_secret",
         "0.1.0",
-        session=Mock(),
+        transport=Mock(spec=Transport),
     )
     client.upload_file = Mock(return_value="upload-1")
     client.get_upload_status = Mock(
@@ -435,25 +431,25 @@ def test_rejects_file_over_max_size_before_request(tmp_path):
     source = tmp_path / "too-large.zip"
     with source.open("wb") as file:
         file.truncate(MAX_FILE_SIZE + 1)
-    session = Mock()
+    transport = Mock(spec=Transport)
     client = GeoDelClient(
         "https://example.com",
         "geodel_secret",
         "0.1.0",
-        session=session,
+        transport=transport,
     )
 
     with pytest.raises(GeoDelError, match="60 MB"):
         client.upload_file(source, "too-large.zip", "org-1")
 
-    session.request.assert_not_called()
+    transport.request.assert_not_called()
 
 
 def test_unreachable_server_raises_server_unavailable_error():
-    session = Mock()
-    session.request.side_effect = requests.ConnectionError("DNS failure")
+    transport = Mock(spec=Transport)
+    transport.request.side_effect = TransportError("DNS failure")
     client = GeoDelClient(
-        "https://example.com", "geodel_secret", "0.1.0", session=session
+        "https://example.com", "geodel_secret", "0.1.0", transport=transport
     )
 
     with pytest.raises(ServerUnavailableError):
@@ -461,10 +457,10 @@ def test_unreachable_server_raises_server_unavailable_error():
 
 
 def test_server_error_raises_server_unavailable_error():
-    session = Mock()
-    session.request.return_value = response(503, {"message": "Unavailable"})
+    transport = Mock(spec=Transport)
+    transport.request.return_value = response(503, {"message": "Unavailable"})
     client = GeoDelClient(
-        "https://example.com", "geodel_secret", "0.1.0", session=session
+        "https://example.com", "geodel_secret", "0.1.0", transport=transport
     )
 
     with pytest.raises(ServerUnavailableError):
@@ -472,9 +468,9 @@ def test_server_error_raises_server_unavailable_error():
 
 
 def test_rejected_key_is_not_server_unavailable():
-    session = Mock()
-    session.request.return_value = response(401, {"message": "Unauthorized"})
-    client = GeoDelClient("https://example.com", "geodel_bad", "0.1.0", session=session)
+    transport = Mock(spec=Transport)
+    transport.request.return_value = response(401, {"message": "Unauthorized"})
+    client = GeoDelClient("https://example.com", "geodel_bad", "0.1.0", transport=transport)
 
     with pytest.raises(AuthenticationError) as error:
         client.list_organizations()

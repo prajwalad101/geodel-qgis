@@ -86,7 +86,7 @@ class PluginRuntimeTests(unittest.TestCase):
         self.patches = ExitStack()
         self.addCleanup(self.patches.close)
         self.network = self.patches.enter_context(patch(
-            "requests.sessions.Session.request",
+            "geodel.qgis_transport.QgisTransport.request",
             side_effect=AssertionError("Network forbidden in runtime tests"),
         ))
         self.version = self.patches.enter_context(patch.object(
@@ -269,9 +269,12 @@ def run():
         print(f"Unexpected runtime: QGIS {Qgis.QGIS_VERSION}, Qt {QT_VERSION_STR}", flush=True)
         return 1
     print(f"Runtime: QGIS {Qgis.QGIS_VERSION}, Qt {QT_VERSION_STR}", flush=True)
-    result = unittest.TextTestRunner(verbosity=2).run(
+    from check_network import NetworkRuntimeTests
+    suite = unittest.TestSuite([
         unittest.defaultTestLoader.loadTestsFromTestCase(PluginRuntimeTests),
-    )
+        unittest.defaultTestLoader.loadTestsFromTestCase(NetworkRuntimeTests),
+    ])
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
 
 

@@ -4,7 +4,9 @@ from pathlib import Path
 from time import monotonic, sleep
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import requests
+from .transport import (
+    Response, Transport, TransportCanceled, TransportError,
+)
 
 from .config import PRODUCT_NAME
 from .recent_upload import RecentUpload, project_recent_upload
@@ -42,7 +44,8 @@ class GeoDelClient:
         base_url: str,
         api_key: str,
         plugin_version: str,
-        session: Optional[requests.Session] = None,
+        transport: Transport,
+        is_canceled: Optional[Callable[[], bool]] = None,
     ) -> None:
         base_url = base_url.rstrip("/")
         self.base_url = (
@@ -50,7 +53,8 @@ class GeoDelClient:
         )
         self.api_key = api_key
         self.plugin_version = plugin_version
-        self.session = session or requests.Session()
+        self.transport = transport
+        self.is_canceled = is_canceled
 
     def list_organizations(self) -> List[Dict[str, Any]]:
         payload = self._get("/organizations")
@@ -132,10 +136,12 @@ class GeoDelClient:
         if is_canceled and is_canceled():
             raise UploadCanceled("Upload canceled")
 
+        is_canceled = is_canceled or self.is_canceled
         initialized = self._request(
             "POST",
             "/uploads/s3/multipart",
             organization_id,
+            is_canceled=is_canceled,
             json={
                 "filename": filename,
                 "type": content_type,
@@ -166,13 +172,14 @@ class GeoDelClient:
                         f"/uploads/s3/multipart/{upload_id}/{part_number}",
                         organization_id,
                         params={"key": key},
+                        is_canceled=is_canceled,
                     )
                     url = signed.get("url")
                     if not isinstance(url, str):
                         raise GeoDelError(
                             f"{PRODUCT_NAME} returned an invalid part upload URL"
                         )
-                    etag = self._put_part(url, chunk)
+                    etag = self._put_part(url, chunk, is_canceled)
                     parts.append({"PartNumber": part_number, "ETag": etag})
                     uploaded += len(chunk)
                     if progress:
@@ -184,16 +191,21 @@ class GeoDelClient:
                 organization_id,
                 params={"key": key},
                 json={"parts": parts},
+                is_canceled=is_canceled,
             )
             registered = self._request(
                 "POST",
                 "/uploads/register",
                 organization_id,
+                is_canceled=is_canceled,
                 json={
                     "attemptId": upload_id,
                     **({"folderId": folder_id} if folder_id else {}),
                 },
             )
+            registered_id = registered.get("id")
+            if not isinstance(registered_id, str):
+                raise GeoDelError(f"{PRODUCT_NAME} returned an invalid upload response")
         except (GeoDelError, OSError) as error:
             try:
                 self._request(
@@ -201,6 +213,7 @@ class GeoDelClient:
                     f"/uploads/s3/multipart/{upload_id}",
                     organization_id,
                     params={"key": key},
+                    is_canceled=lambda: False,
                 )
             except GeoDelError:
                 pass
@@ -208,9 +221,6 @@ class GeoDelClient:
                 raise
             raise GeoDelError(f"Could not read upload file: {error}") from error
 
-        registered_id = registered.get("id")
-        if not isinstance(registered_id, str):
-            raise GeoDelError(f"{PRODUCT_NAME} returned an invalid upload response")
         return registered_id
 
     def publish_file(
@@ -238,8 +248,8 @@ class GeoDelClient:
             if is_canceled and is_canceled():
                 raise UploadCanceled("Upload canceled")
             try:
-                status = self.get_upload_status(upload_id, organization_id)
-            except (AuthenticationError, AuthorizationError):
+                status = self.get_upload_status(upload_id, organization_id, is_canceled)
+            except (AuthenticationError, AuthorizationError, UploadCanceled):
                 raise
             except GeoDelError:
                 status_errors += 1
@@ -254,8 +264,8 @@ class GeoDelClient:
                     )
                 if status["status"] == "ready":
                     try:
-                        share_token = self.get_share_token(upload_id, organization_id)
-                    except (AuthenticationError, AuthorizationError):
+                        share_token = self.get_share_token(upload_id, organization_id, is_canceled)
+                    except (AuthenticationError, AuthorizationError, UploadCanceled):
                         raise
                     except GeoDelError:
                         share_token_errors += 1
@@ -281,8 +291,11 @@ class GeoDelClient:
 
         return {"timedOut": True}
 
-    def get_upload_status(self, upload_id: str, organization_id: str) -> Dict[str, Any]:
-        payload = self._get(f"/uploads/{upload_id}/status", organization_id)
+    def get_upload_status(
+        self, upload_id: str, organization_id: str,
+        is_canceled: Optional[Callable[[], bool]] = None,
+    ) -> Dict[str, Any]:
+        payload = self._get(f"/uploads/{upload_id}/status", organization_id, is_canceled=is_canceled)
         if (
             payload.get("id") != upload_id
             or payload.get("status") not in ("pending", "processing", "ready", "failed")
@@ -292,8 +305,11 @@ class GeoDelClient:
             raise GeoDelError(f"{PRODUCT_NAME} returned an invalid upload status")
         return payload
 
-    def get_share_token(self, upload_id: str, organization_id: str) -> str:
-        payload = self._get(f"/uploads/{upload_id}/detail", organization_id)
+    def get_share_token(
+        self, upload_id: str, organization_id: str,
+        is_canceled: Optional[Callable[[], bool]] = None,
+    ) -> str:
+        payload = self._get(f"/uploads/{upload_id}/detail", organization_id, is_canceled=is_canceled)
         token = payload.get("shareToken")
         if not isinstance(token, str):
             raise GeoDelError(f"{PRODUCT_NAME} returned an invalid share link")
@@ -304,8 +320,9 @@ class GeoDelClient:
         path: str,
         organization_id: Optional[str] = None,
         params: Optional[Dict[str, Any]] = None,
+        is_canceled: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
-        return self._request("GET", path, organization_id, params=params)
+        return self._request("GET", path, organization_id, params=params, is_canceled=is_canceled)
 
     def _request(
         self,
@@ -321,53 +338,56 @@ class GeoDelClient:
             headers["X-Organization-Id"] = organization_id
 
         try:
-            response = self.session.request(
+            response = self.transport.request(
                 method,
                 f"{self.base_url}{path}",
                 headers=headers,
                 timeout=15,
+                is_canceled=kwargs.pop("is_canceled", None) or self.is_canceled,
                 **{key: value for key, value in kwargs.items() if value is not None},
             )
-            if response.status_code == 401:
-                raise AuthenticationError("API key is invalid or revoked")
-            if response.status_code == 403:
-                raise AuthorizationError(
-                    "API key does not have access to this resource"
-                )
-            try:
-                response.raise_for_status()
-            except requests.RequestException as error:
-                reason = _response_error(response)
-                detail = reason or str(error)
-                if response.status_code >= 500:
-                    raise ServerUnavailableError(
-                        f"{PRODUCT_NAME} request failed: {detail}"
-                    ) from error
-                raise GeoDelError(f"{PRODUCT_NAME} request failed: {detail}") from error
-            payload = response.json()
-        except (AuthenticationError, AuthorizationError):
-            raise
-        except GeoDelError:
-            raise
-        except (requests.ConnectionError, requests.Timeout) as error:
+        except TransportCanceled as error:
+            raise UploadCanceled("Upload canceled") from error
+        except TransportError as error:
             raise ServerUnavailableError(
-                f"{PRODUCT_NAME} request failed: {error}"
+                f"{PRODUCT_NAME} request failed: Network, TLS or timeout failure"
             ) from error
-        except (requests.RequestException, ValueError) as error:
-            raise GeoDelError(f"{PRODUCT_NAME} request failed: {error}") from error
-
+        if response.status_code == 401:
+            raise AuthenticationError("API key is invalid or revoked")
+        if response.status_code == 403:
+            raise AuthorizationError("API key does not have access to this resource")
+        if response.status_code >= 400 or response.status_code < 200:
+            reason = _response_error(response) or f"HTTP {response.status_code}"
+            # Service error bodies are untrusted and may echo the submitted key.
+            if self.api_key:
+                reason = reason.replace(self.api_key, "[redacted]")
+            failure = ServerUnavailableError if response.status_code >= 500 else GeoDelError
+            raise failure(f"{PRODUCT_NAME} request failed: {reason}")
+        try:
+            payload = response.json()
+        except (ValueError, UnicodeError) as error:
+            raise GeoDelError(f"{PRODUCT_NAME} returned invalid JSON") from error
         if not isinstance(payload, dict):
             raise GeoDelError(f"{PRODUCT_NAME} returned an invalid response")
         return payload
 
-    def _put_part(self, url: str, data: bytes) -> str:
+    def _put_part(
+        self, url: str, data: bytes,
+        is_canceled: Optional[Callable[[], bool]] = None,
+    ) -> str:
         try:
-            response = self.session.request("PUT", url, data=data, timeout=60)
-            response.raise_for_status()
-        except requests.RequestException as error:
-            raise GeoDelError(f"Part upload failed: {error}") from error
-        etag = response.headers.get("ETag")
-        if not isinstance(etag, str) or not etag:
+            response = self.transport.request(
+                "PUT", url, data=data, timeout=60,
+                is_canceled=is_canceled or self.is_canceled,
+            )
+        except TransportCanceled as error:
+            raise UploadCanceled("Upload canceled") from error
+        except TransportError as error:
+            raise GeoDelError("Part upload failed: Network, TLS or timeout failure") from error
+        if not 200 <= response.status_code < 300:
+            raise GeoDelError(f"Part upload failed: HTTP {response.status_code}")
+        etag = response.header("ETag")
+        if not etag:
             raise GeoDelError("Storage returned no ETag for uploaded part")
         return etag
 
@@ -399,7 +419,7 @@ def _valid_folder(folder: Any) -> bool:
     )
 
 
-def _response_error(response: requests.Response) -> str:
+def _response_error(response: Response) -> str:
     try:
         payload = response.json()
     except ValueError:

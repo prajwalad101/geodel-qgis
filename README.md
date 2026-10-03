@@ -23,7 +23,10 @@ dependencies are pinned in `requirements-dev.txt`. The behavior tests use
 synthetic fixtures and QGIS doubles; they do not need QGIS, network access,
 or any other repository. QGIS integration tests run separately in real QGIS/Qt runtimes. They use a
 small interface host backed by real Qt menus, toolbar, dock widgets, QGIS tasks
-and Authentication Manager; only service responses are synthetic. They cover
+and Authentication Manager. Network tests use controlled local HTTP, proxy,
+and self-signed TLS fixtures, including redirects, credential/cache isolation,
+deadlines, cancellation, and cleanup. Lifecycle tests use synthetic service
+responses. They cover
 entry-point loading, repeated GUI initialization, open/close, unload/reload,
 cancellation and late callbacks, encrypted key replacement, and share-link copy.
 
@@ -64,12 +67,19 @@ notices. Generated archives are ignored and must not be committed.
 
 ## QGIS installation and use
 
-The plugin imports `requests`, which is not bundled. If your QGIS Python
-console cannot `import requests`, install it into **QGIS's Python environment**
-using that installation's Python executable and `-m pip install requests==2.34.2`.
-The development virtual environment does not install packages into QGIS.
-QGIS supplies the `qgis` and `qgis.PyQt` modules; do not install separate Qt
-bindings into the plugin.
+Networking uses QGIS's native `QgsBlockingNetworkRequest` inside background
+tasks, honoring QGIS proxy, TLS, and network settings. No extra Python runtime
+packages are required. QGIS supplies the `qgis` and `qgis.PyQt` modules; do not
+install separate Qt bindings into the plugin.
+
+API calls have a 15-second deadline and signed-storage transfers have a
+60-second deadline. Cancellation aborts active requests; failed or canceled
+multipart uploads attempt cleanup with an independent 15-second deadline.
+Authenticated responses bypass cache. API redirects may stay on the same
+origin; cross-origin API redirects and HTTPS downgrades are refused. Signed
+storage requests and their redirects never carry GeoDel authentication,
+organization, or plugin-version headers. Request failures contain no submitted
+Personal API Key.
 
 Install `dist/geodel.zip` through **Plugins → Manage and Install Plugins →
 Install from ZIP**. Open GeoDel from **Web → GeoDel** or its Web toolbar icon, choose **Open API Key

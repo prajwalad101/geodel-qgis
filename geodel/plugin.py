@@ -246,7 +246,7 @@ class GeoDelPlugin:
         QgsApplication.taskManager().addTask(task)
 
     def _organization_timed_out(self):
-        # requests' timeout doesn't bound DNS or a task that never runs.
+        # Bound connection feedback even when its task has not started.
         task = self._organization_task
         if task is None:
             return

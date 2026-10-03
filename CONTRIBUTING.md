@@ -44,4 +44,4 @@ uv pip compile --universal requirements-dev.in -o requirements-dev.txt
 ```
 
 Install the updated pins into a fresh virtual environment and run the suite.
-The `requests` runtime version in README must match the tested pin.
+Runtime networking must use QGIS APIs; do not add a separate HTTP library.

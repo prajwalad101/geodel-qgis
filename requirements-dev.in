@@ -1,3 +1,2 @@
-# Runtime dependency plus standalone behavior-test runner.
-requests==2.34.2
+# Standalone behavior-test runner; QGIS supplies runtime networking.
 pytest==9.1.1
