@@ -1,6 +1,6 @@
 """Blocking native QGIS HTTP, called only from plugin background tasks.
 
-QGIS's blocking helper replaces cache attributes and rebuilds redirect requests.
+Each call owns a fresh QGIS network manager and follows redirects explicitly.
 Reload-safe process-lifetime hooks, installed on the GUI thread,
 restore policy only inside this thread's request scope. They retain no keys
 between calls and leave every other QGIS request untouched. Registering and
@@ -13,11 +13,10 @@ from time import monotonic
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlencode
 
-from qgis.PyQt.QtCore import QByteArray, QThread, QTimer, QUrl
-from qgis.PyQt.QtNetwork import QNetworkRequest, QSslError
-from qgis.core import (
-    QgsApplication, QgsBlockingNetworkRequest, QgsFeedback, QgsNetworkAccessManager,
-)
+from qgis.PyQt import sip
+from qgis.PyQt.QtCore import QByteArray, QEventLoop, QThread, QTimer, QUrl
+from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest, QSslError
+from qgis.core import QgsApplication, QgsNetworkAccessManager
 
 from .transport import Response, TransportCanceled, TransportError, TransportTimeout
 
@@ -68,14 +67,16 @@ def _prepare_request(request):
     request.setAttribute(QNetworkRequest.Attribute.CacheLoadControlAttribute,
                          QNetworkRequest.CacheLoadControl.AlwaysNetwork)
     request.setAttribute(QNetworkRequest.Attribute.CacheSaveControlAttribute, False)
-    # Allow QGIS's configured proxy credentials. Qt's Manual authentication
-    # flag also disables proxy retries; prior origin auth is cleared below.
+    # The isolated manager has no origin credentials. Allow configured proxy
+    # authentication; Qt's Manual flag would also disable proxy retries.
     request.setAttribute(QNetworkRequest.Attribute.AuthenticationReuseAttribute,
                          QNetworkRequest.LoadControl.Automatic)
     request.setAttribute(QNetworkRequest.Attribute.CookieLoadControlAttribute,
                          QNetworkRequest.LoadControl.Manual)
     request.setAttribute(QNetworkRequest.Attribute.CookieSaveControlAttribute,
                          QNetworkRequest.LoadControl.Manual)
+    request.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
+                         QNetworkRequest.RedirectPolicy.ManualRedirectPolicy)
 
 
 def _prepare_reply(_request, reply):
@@ -154,10 +155,13 @@ class QgisTransport:
             any(name.lower() in {header.lower() for header in _CREDENTIAL_HEADERS}
                 for name in request_headers),
         )
-        request = QNetworkRequest(request_url)
-        feedback = QgsFeedback()
-        blocking = QgsBlockingNetworkRequest()
+        # Construction retains QGIS's proxy factory (which resolves through the
+        # current thread's configured manager) and TLS request preparation, but
+        # gives this call its own authentication/connection cache. Do not call
+        # setupDefaultProxyAndCache: that wires up shared cookies and auth dialogs.
+        manager = QgsNetworkAccessManager()
         timer = QTimer()
+        reply = None
         deadline = monotonic() + timeout
         expired = False
         canceled = False
@@ -166,53 +170,66 @@ class QgisTransport:
             nonlocal expired, canceled
             canceled = bool(is_canceled and is_canceled())
             expired = monotonic() >= deadline
-            if canceled or expired:
-                feedback.cancel()
+            if (canceled or expired) and reply is not None:
+                reply.abort()
 
-        manager = QgsNetworkAccessManager.instance()
-        # Never inherit another request's HTTP authentication, including on
-        # signed storage. QGIS's configured proxy credentials are unaffected.
-        manager.clearAccessCache()
-        # This worker's NAM is shared only by operations on this thread. Avoid
-        # modal HTTP/proxy-auth dialogs; configured proxy credentials still
-        # come from QGIS. Other threads' managers and settings stay untouched.
-        signals_blocked = manager.blockSignals(True)
+        def manager_timeout(_reply):
+            nonlocal expired
+            expired = True
+
+        manager.requestTimedOut[QNetworkReply].connect(manager_timeout)
         timer.setInterval(25)
         timer.timeout.connect(check_request)
         _request_scope.policy = policy
         timer.start()
         try:
-            if method == "GET":
-                code = blocking.get(
-                    request, True, feedback,
-                    QgsBlockingNetworkRequest.RequestFlag.EmptyResponseIsValid,
-                )
-            elif method == "POST":
-                code = blocking.post(request, QByteArray(data or b""), True, feedback)
-            elif method == "PUT":
-                code = blocking.put(request, QByteArray(data or b""), feedback)
-            else:
-                code = blocking.deleteResource(request, feedback)
-            if canceled or (is_canceled and is_canceled()):
-                raise TransportCanceled("Request canceled")
-            if expired or monotonic() >= deadline or code == QgsBlockingNetworkRequest.ErrorCode.TimeoutError:
-                raise TransportTimeout("Request timed out")
-            if policy.blocked:
-                raise TransportError("Unsafe or excessive redirect")
-            reply = blocking.reply()
-            status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-            # QGIS reports HTTP 4xx/5xx as errors too; preserve status for the client.
-            if not status or (code != QgsBlockingNetworkRequest.ErrorCode.NoError and int(status) < 400):
-                raise TransportError("Network or TLS failure")
-            response_headers = {
-                bytes(name).decode("latin-1"): bytes(reply.rawHeader(name)).decode("latin-1")
-                for name in reply.rawHeaderList()
-            }
-            return Response(int(status), bytes(reply.content()), response_headers)
+            next_url = request_url
+            while True:
+                check_request()
+                if canceled:
+                    raise TransportCanceled("Request canceled")
+                if expired:
+                    raise TransportTimeout("Request timed out")
+                request = QNetworkRequest(next_url)
+                if method == "GET":
+                    reply = manager.get(request)
+                elif method == "POST":
+                    reply = manager.post(request, QByteArray(data or b""))
+                elif method == "PUT":
+                    reply = manager.put(request, QByteArray(data or b""))
+                else:
+                    reply = manager.deleteResource(request)
+                loop = QEventLoop()
+                reply.finished.connect(loop.quit)
+                if not reply.isFinished():
+                    loop.exec()
+                reply.finished.disconnect(loop.quit)
+                if canceled or (is_canceled and is_canceled()):
+                    raise TransportCanceled("Request canceled")
+                if expired or monotonic() >= deadline or reply.error() == QNetworkReply.NetworkError.TimeoutError:
+                    raise TransportTimeout("Request timed out")
+                if policy.blocked:
+                    raise TransportError("Unsafe or excessive redirect")
+                status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+                # Qt reports HTTP 4xx/5xx as errors too; preserve status for the client.
+                if not status or (reply.error() != QNetworkReply.NetworkError.NoError and int(status) < 400):
+                    raise TransportError("Network or TLS failure")
+                redirect = reply.attribute(QNetworkRequest.Attribute.RedirectionTargetAttribute)
+                if redirect is not None and 300 <= int(status) < 400:
+                    next_url = policy.url.resolved(redirect)
+                    reply.deleteLater()
+                    reply = None
+                    continue
+                response_headers = {
+                    bytes(name).decode("latin-1"): bytes(reply.rawHeader(name)).decode("latin-1")
+                    for name in reply.rawHeaderList()
+                }
+                return Response(int(status), bytes(reply.readAll()), response_headers)
         finally:
             timer.stop()
             timer.timeout.disconnect(check_request)
-            # QGIS connects feedback to its helper internally. Release all slots.
-            feedback.canceled.disconnect()
             del _request_scope.policy
-            manager.blockSignals(signals_blocked)
+            if reply is not None:
+                reply.abort()
+            # Destroy in the worker thread, including replies and cached credentials.
+            sip.delete(manager)

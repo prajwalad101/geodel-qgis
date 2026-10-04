@@ -163,7 +163,7 @@ class NetworkRuntimeTests(unittest.TestCase):
             return QgisTransport().request("GET", self.url)
         self.assertEqual(self.in_task(operation).status_code, 200)
 
-    def test_cancel_active_task_aborts_feedback_and_stops_timer(self):
+    def test_cancel_active_task_aborts_reply_and_stops_timer(self):
         from geodel.qgis_transport import QgisTransport
         from geodel.transport import TransportCanceled
         from qgis.PyQt.QtCore import QTimer
@@ -404,7 +404,7 @@ class NetworkRuntimeTests(unittest.TestCase):
             "GET", self.url + "/redirect", headers={"Authorization": "Bearer synthetic-key"}))
         self.assertEqual(self.server.received[-1][2]["authorization"], "Bearer synthetic-key")
 
-    def test_cached_origin_credentials_never_reach_storage_or_open_login_dialog(self):
+    def test_cached_origin_credentials_survive_geodel_without_reaching_storage(self):
         from qgis.core import QgsBlockingNetworkRequest, QgsNetworkAccessManager
         from qgis.PyQt.QtCore import QUrl, Qt
         from qgis.PyQt.QtNetwork import QNetworkRequest
@@ -434,8 +434,24 @@ class NetworkRuntimeTests(unittest.TestCase):
                 self.assertLess(time.monotonic() - started, 0.4)
                 self.assertFalse(manager.signalsBlocked())
                 self.assertEqual(prompts, [])
+                # A later provider request on this same pool thread must still
+                # reuse its seeded credentials without another auth challenge.
+                received = len(self.server.received)
+                unrelated = QgsBlockingNetworkRequest()
+                # Make a regression return 401 instead of opening a modal login
+                # dialog if GeoDel has accidentally evicted the cached password.
+                previous = manager.blockSignals(True)
+                try:
+                    unrelated.get(QNetworkRequest(QUrl(self.url + "/unrelated")), True)
+                finally:
+                    manager.blockSignals(previous)
+                self.assertEqual(unrelated.reply().attribute(
+                    QNetworkRequest.Attribute.HttpStatusCodeAttribute), 200)
+                self.assertEqual(len(self.server.received), received + 1)
+                self.assertEqual(prompts, [])
             finally:
                 manager.requestRequiresAuth.disconnect(unexpected_prompt)
         self.in_task(operation)
-        self.assertIn("authorization", self.server.received[-2][2])
-        self.assertNotIn("authorization", self.server.received[-1][2])
+        self.assertIn("authorization", self.server.received[-3][2])
+        self.assertNotIn("authorization", self.server.received[-2][2])
+        self.assertIn("authorization", self.server.received[-1][2])
