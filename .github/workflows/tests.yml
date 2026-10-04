@@ -167,7 +167,32 @@ jobs:
         run: |
           python scripts/validate_package.py "dist/geodel-$VERSION.zip" --tag "$RELEASE_TAG" --commit "$SOURCE_COMMIT"
           (cd dist && sha256sum --check "geodel-$VERSION.zip.sha256")
+          python - <<'PYTHON'
+          from configparser import ConfigParser
+          from pathlib import Path
+
+          metadata = ConfigParser()
+          metadata.read("geodel/metadata.txt")
+          version = metadata["general"]["version"]
+          changes = metadata["general"]["changelog"].removeprefix(f"{version}: ")
+          Path("dist/release-notes.md").write_text(f"""Upload and share vector GIS data from QGIS to GeoDel.
+
+          ## Changes
+
+          {changes}
+
+          ## Install
+
+          1. Download `geodel-{version}.zip` and its `.sha256` checksum from the assets below.
+          2. In QGIS, open **Plugins > Manage and Install Plugins > Install from ZIP** and select the plugin ZIP.
+          3. Open **Web > GeoDel** and connect with your Personal API Key.
+
+          Supports QGIS 3.44–4.x. Requires a GeoDel account, Workspace, internet connection, and active trial or subscription. No additional Python packages are needed.
+
+          [Usage and help](https://github.com/prajwalad101/geodel-qgis/blob/main/README.md)
+          """)
+          PYTHON
           gh release create "$RELEASE_TAG" \
             "dist/geodel-$VERSION.zip" "dist/geodel-$VERSION.zip.sha256" \
             --verify-tag --draft --title "GeoDel QGIS $VERSION" \
-            --notes-file RELEASE.md
+            --notes-file dist/release-notes.md
