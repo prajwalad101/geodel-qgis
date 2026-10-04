@@ -17,11 +17,6 @@ and copy a Personal API Key, paste it into the masked field, then choose
 **Save and connect**. QGIS Authentication Manager encrypts the key and may ask
 you to set or unlock its master password. Keep that password available.
 
-![Connection setup](docs/connection.png)
-
-Screenshots use real QGIS 4.2/Qt6 widgets with synthetic state, rendered offline.
-They are usage illustrations, not evidence of manual platform testing.
-
 ## Upload and share
 
 Choose your Workspace and destination folder (or Files root). Select 1–20
@@ -42,8 +37,6 @@ open. When ready, choose **Copy link** in the list or **Copy share link** in
 the notification. Verify the destination and sharing permissions on GeoDel
 before distributing a link. Failed layers and health warnings link to details
 on the website. See [synthetic sample](sample/README.md) for a safe first test.
-
-![Upload panel](docs/uploads.png)
 
 ## Data transfer and credentials
 

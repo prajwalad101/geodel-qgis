@@ -13,7 +13,7 @@ PACKAGE_FILES = (
     "icon.png", "layer_export.py", "LICENSE", "metadata.txt", "NOTICE.md",
     "plugin.py", "recent_upload.py", "transport.py", "qgis_transport.py",
     "task_lifecycle.py", "dock.py", "tasks.py", "metadata.py", "README.md",
-    "docs/connection.png", "docs/uploads.png", "sample/places.geojson",
+    "sample/places.geojson",
     "sample/README.md",
 )
 MAX_ARCHIVE_SIZE = 25_000_000
@@ -63,7 +63,7 @@ def validate_package(path, project, tag=None, commit=None):
         }
         if urls != {"API_URL": "https://api.geodel.app", "WEB_URL": "https://geodel.app"}:
             raise ValueError("Development or unexpected service URLs")
-        for name in ("icon.png", "docs/connection.png", "docs/uploads.png"):
+        for name in ("icon.png",):
             if not archive.read(f"geodel/{name}").startswith(b"\x89PNG\r\n\x1a\n"):
                 raise ValueError(f"Invalid PNG asset: {name}")
         if b"GNU GENERAL PUBLIC LICENSE" not in archive.read("geodel/LICENSE"):

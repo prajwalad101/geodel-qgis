@@ -28,7 +28,9 @@ complete runtime security assessment.
 - Preserved the GeoDel contributor copyright and GPL-3.0-or-later grant;
   included the complete GNU GPL v3 text in repository and package LICENSE.
   `geodel/NOTICE.md` records resource provenance and external dependencies.
-- QGIS/Qt and requests are external dependencies, not copied into the ZIP.
+- QGIS/Qt provide the runtime, including networking; no additional runtime
+  Python packages are required. Development scan tools depend on requests,
+  which is not included in the plugin ZIP.
   No third-party fixture data or artwork is shipped.
 - Standalone support files replace the previous history-export tooling.
   Release tooling pushes only this repository's history; it is not run as

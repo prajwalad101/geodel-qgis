@@ -10,7 +10,7 @@ is unchanged. Native networking dependency #300 is present in this checkout.
 
 ## Reproduce from a clean standalone checkout
 
-Follow README contributor setup, check out the intended commit, then run:
+Follow CONTRIBUTING.md contributor setup, check out the intended commit, then run:
 
 ```sh
 scripts/release.sh 0.1.1
@@ -24,13 +24,12 @@ assets, size and every packaged file against the selected Git commit.
 Only `geodel/` is installed; tests, release tools, repository internals, secrets,
 profiles and development dependencies stay outside the archive.
 
-Run the README Docker commands for both real QGIS runtimes and the official
+Run the CONTRIBUTING.md Docker commands for both real QGIS runtimes and the official
 Qt6 checker. CI runs unit tests, typechecking, Flake8, Bandit and detect-secrets,
 then repeats scans and Qt6 checking against the extracted ZIP. Runtime tests
 also import the extracted plugin. No production credentials are needed.
 Download the candidate artifact from the **Plugin tests** run for the exact
-commit; verify its SHA-256 before manual installation. Never treat screenshots
-or automated runtime tests as completed manual platform verification.
+commit; verify its SHA-256 before manual installation. Automated runtime tests do not replace manual platform verification.
 
 ## Owner's final steps
 
