@@ -163,6 +163,62 @@ class NetworkRuntimeTests(unittest.TestCase):
             return QgisTransport().request("GET", self.url)
         self.assertEqual(self.in_task(operation).status_code, 200)
 
+    def test_finished_reply_disposal_preserves_response_errors_and_cleanup(self):
+        from unittest.mock import patch
+        from qgis.PyQt.QtCore import QCoreApplication, QEvent, QEventLoop, Qt
+        from qgis.core import QgsNetworkAccessManager
+        import geodel.qgis_transport as transport
+        from geodel.transport import TransportCanceled, TransportTimeout
+
+        disposed = []
+        test = self
+
+        class DrainDeferredDeletesLoop(QEventLoop):
+            def exec(self):
+                before = len(disposed)
+                result = super().exec()
+                # Pin the CI timing: Qt disposes a finished reply before the
+                # transport resumes after its nested event loop.
+                QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                test.assertGreater(len(disposed), before, "Finished reply was not disposed")
+                return result
+
+        class DisposeRepliesManager(QgsNetworkAccessManager):
+            def get(self, request):
+                reply = super().get(request)
+                reply.destroyed.connect(lambda: disposed.append(True), Qt.ConnectionType.DirectConnection)
+                reply.finished.connect(reply.deleteLater, Qt.ConnectionType.DirectConnection)
+                if request.url().path() == "/completed":
+                    completed_loop = QEventLoop()
+                    reply.finished.connect(completed_loop.quit, Qt.ConnectionType.DirectConnection)
+                    if not reply.isFinished():
+                        completed_loop.exec()
+                    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                return reply
+
+        with patch.object(transport, "QgsNetworkAccessManager", DisposeRepliesManager), \
+                patch.object(transport, "QEventLoop", DrainDeferredDeletesLoop):
+            def operation(_task):
+                response = transport.QgisTransport().request("GET", self.url)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.body, self.server.body)
+                self.assertEqual(response.header("etag"), '\"local-etag\"')
+                completed = transport.QgisTransport().request("GET", self.url + "/completed")
+                self.assertEqual(completed.body, self.server.body)
+                self.server.redirect_url = "/destination"
+                redirected = transport.QgisTransport().request("GET", self.url + "/redirect")
+                self.assertEqual(redirected.body, self.server.body)
+                with self.assertRaises(TransportTimeout):
+                    transport.QgisTransport().request("GET", self.url + "/slow", timeout=0.1)
+                cancel_at = time.monotonic() + 0.05
+                with self.assertRaises(TransportCanceled):
+                    transport.QgisTransport().request(
+                        "GET", self.url + "/slow", is_canceled=lambda: time.monotonic() >= cancel_at)
+                self.assertEqual(transport.QgisTransport().request("GET", self.url).status_code, 200)
+                self.server.status = 503
+                self.assertEqual(transport.QgisTransport().request("GET", self.url).status_code, 503)
+            self.in_task(operation)
+
     def test_cancel_active_task_aborts_reply_and_stops_timer(self):
         from geodel.qgis_transport import QgisTransport
         from geodel.transport import TransportCanceled
