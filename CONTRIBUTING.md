@@ -13,8 +13,9 @@ When adding a package file, update the package allowlist in `scripts/validate_pa
 Test user-facing behavior; keep fixtures synthetic and independent of services.
 Changes affecting QGIS integration must pass the real-runtime tests on QGIS
 3.44/Qt5 and 4.2/Qt6 and the official Qt6 checker; see the runtime commands below.
-The owner completes the manual checklist before releases on QGIS 3.44 and
-latest stable, recording version, OS, date, and actual outcomes.
+Before releasing, manually verify installation, connection, upload and sharing
+on QGIS 3.44 and latest stable. Record the tested version, OS and outcomes in
+the release notes.
 
 Never commit secrets, real customer datasets, credential stores, profiles,
 generated ZIPs, or dependencies. Preserve copyright and license notices.
@@ -62,7 +63,6 @@ docker run --rm --network none --entrypoint python3 \
 ```
 
 The official Qt6 checker fails when its dry-run report contains findings.
-Runtime tests supplement the fresh [manual release checklist](MANUAL_TEST_CHECKLIST.md).
 See [release handoff](RELEASE.md) for package verification and publication steps.
 
 ## Local service development

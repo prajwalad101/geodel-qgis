@@ -63,7 +63,6 @@ plugin version, QGIS build, OS, and steps to reproduce.
 
 ## Development and license
 
-[Contributing](CONTRIBUTING.md) · [Release verification](RELEASE.md) ·
-[Manual checklist](MANUAL_TEST_CHECKLIST.md)
+[Contributing](CONTRIBUTING.md) · [Release verification](RELEASE.md)
 
 GPL-3.0-or-later. See [LICENSE](LICENSE) and [resource notices](geodel/NOTICE.md).

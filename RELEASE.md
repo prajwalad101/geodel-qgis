@@ -33,11 +33,11 @@ commit; verify its SHA-256 before manual installation. Automated runtime tests d
 
 ## Owner's final steps
 
-1. Confirm all CI jobs passed for the intended commit. Complete a new copy of
-   MANUAL_TEST_CHECKLIST.md on supported desktop platforms, QGIS 3.44 LTR and
-   latest stable QGIS (including Qt6). Record exact builds, OS versions, tester,
-   date, commit, ZIP checksum and actual outcomes. Fix failures and repeat for
-   any new candidate commit. Never reuse checked boxes from older tests.
+1. Confirm all CI jobs passed for the intended commit. Install the candidate ZIP
+   on QGIS 3.44 LTR and latest stable QGIS (including Qt6) on your target desktop
+   platforms. Verify connection, sample upload, sharing and plugin reload.
+   Record the commit, checksum, QGIS build, OS, tester, date and outcomes in
+   release notes. Fix failures and repeat verification for a changed candidate.
 2. Merge the verified commit to `main`. Only after manual signoff, create and
    push annotated tag `v0.1.1` at that exact commit. This is an owner action.
    The tag CI run repeats every required check, validates tag/metadata agreement,
@@ -54,7 +54,7 @@ commit; verify its SHA-256 before manual installation. Automated runtime tests d
 6. After approval, install through the official QGIS Plugin Manager on a clean
    profile and verify version, connection and sample upload/share behavior.
 7. Record the accepted Plugin Repository URL and installation verification in
-   the execution record. Update README and packaged usage docs with that exact
+   the release notes. Update README and packaged usage docs with that exact
    URL and official Plugin Manager installation link/instructions. Until then,
    installation links must direct users to verified ZIPs, not an invented listing.
 
