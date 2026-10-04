@@ -65,4 +65,4 @@ plugin version, QGIS build, OS, and steps to reproduce.
 
 [Contributing](CONTRIBUTING.md) · [Release verification](RELEASE.md)
 
-GPL-3.0-or-later. See [LICENSE](LICENSE) and [resource notices](geodel/NOTICE.md).
+GPL-3.0-or-later. See [LICENSE](LICENSE) and [resource attribution](geodel/README.md#license-and-resources).

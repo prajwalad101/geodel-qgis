@@ -108,5 +108,4 @@ def _valid_upload(upload: Any) -> bool:
         and summary["total"] == summary["ready"] + summary["failed"]
         and summary["failed"] == len(summary["failedLayers"])
         and (upload["status"] != "ready" or summary["ready"] > 0)
-        and (upload["status"] != "failed" or summary["ready"] == 0)
     )
