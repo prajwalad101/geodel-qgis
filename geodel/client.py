@@ -23,7 +23,7 @@ class GeoDelError(Exception):
 
 
 class AuthenticationError(GeoDelError):
-    """The API rejected the configured key."""
+    """The API could not authenticate the request."""
 
 
 class AuthorizationError(GeoDelError):
@@ -354,16 +354,12 @@ class GeoDelClient:
                 f"{PRODUCT_NAME} request failed: Network, TLS or timeout failure"
             ) from error
         if response.status_code == 401:
-            raise AuthenticationError("API key is invalid or revoked")
+            raise AuthenticationError("Authentication failed. Reconnect and try again.")
         if response.status_code == 403:
-            raise AuthorizationError("API key does not have access to this resource")
+            raise AuthorizationError(_http_error_message(response))
         if response.status_code >= 400 or response.status_code < 200:
-            reason = _response_error(response) or f"HTTP {response.status_code}"
-            # Service error bodies are untrusted and may echo the submitted key.
-            if self.api_key:
-                reason = reason.replace(self.api_key, "[redacted]")
             failure = ServerUnavailableError if response.status_code >= 500 else GeoDelError
-            raise failure(f"{PRODUCT_NAME} request failed: {reason}")
+            raise failure(_http_error_message(response))
         try:
             payload = response.json()
         except (ValueError, UnicodeError) as error:
@@ -420,12 +416,71 @@ def _valid_folder(folder: Any) -> bool:
     )
 
 
-def _response_error(response: Response) -> str:
+def _http_error_message(response: Response) -> str:
+    # Only interpret documented reason codes or exact server messages with
+    # their expected status. Never display arbitrary error bodies or infer an
+    # API-key problem from a generic denial.
     try:
         payload = response.json()
     except ValueError:
-        return ""
-    if not isinstance(payload, dict):
-        return ""
-    reason = payload.get("error") or payload.get("message")
-    return reason if isinstance(reason, str) else ""
+        payload = None
+    status = response.status_code
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    messages = {
+        "trial_expired": (
+            f"Your workspace trial has expired. Manage your subscription in {PRODUCT_NAME}."
+        ),
+        "capacity_exhausted": (
+            "This upload would exceed your workspace storage capacity. "
+            f"Delete files or upgrade your plan in {PRODUCT_NAME}."
+        ),
+        "subscription_on_hold": (
+            "Your workspace subscription is on hold. "
+            f"Update your payment method in {PRODUCT_NAME}."
+        ),
+        "subscription_required": (
+            "Your workspace needs a subscription to upload files. "
+            f"Manage your subscription in {PRODUCT_NAME}."
+        ),
+    }
+    if status == 403 and isinstance(reason, str) and reason in messages:
+        return messages[reason]
+    message = (payload.get("error") or payload.get("message")) if isinstance(payload, dict) else None
+    known_messages = {
+        (400, "Invalid request"): (
+            f"{PRODUCT_NAME} rejected the request as invalid. Try again; if it persists, contact support."
+        ),
+        (400, "X-Organization-Id header is required for API key requests"): (
+            "No workspace was sent with this request. Select a workspace and reconnect."
+        ),
+        (400, "uploaded object size is unavailable"): (
+            f"{PRODUCT_NAME} could not verify the uploaded file size. Try uploading again."
+        ),
+        (400, "uploaded object size does not match request"): (
+            "The uploaded file size does not match the submitted size. Try uploading again."
+        ),
+        (400, "Multipart upload reference is invalid"): (
+            "The upload reference is invalid. Start the upload again."
+        ),
+        (403, "Upload attempt does not belong to the current session"): (
+            "This upload attempt belongs to a different account or workspace. "
+            "Reconnect to the intended workspace and start again."
+        ),
+        (404, "Upload attempt not found"): (
+            "The upload attempt was not found. Start the upload again."
+        ),
+        (404, "Upload not found"): "The upload was not found. Refresh recent uploads.",
+        (404, "Folder not found"): "The selected folder was not found. Refresh and choose a folder again.",
+        (404, "Organization not found"): "The selected workspace was not found. Refresh and select a workspace again.",
+    }
+    if isinstance(message, str) and (status, message) in known_messages:
+        return known_messages[status, message]
+    if status == 403:
+        return f"Request denied by {PRODUCT_NAME} (HTTP 403)."
+    if status == 413:
+        return "The upload request exceeds the server's size limit. Use a smaller file."
+    if status == 429:
+        return f"Too many requests to {PRODUCT_NAME}. Wait a moment and try again."
+    if status >= 500:
+        return f"{PRODUCT_NAME} server error (HTTP {status}). Try again later."
+    return f"{PRODUCT_NAME} request failed (HTTP {status})."

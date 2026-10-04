@@ -33,14 +33,12 @@ SERVER_UNAVAILABLE_MESSAGE = (
     "Couldn't connect to server. If this keeps happening please contact support."
 )
 SAVED_KEY_REJECTED_MESSAGE = (
-    "Your saved API key is no longer valid. It may have been revoked. "
-    "Create a new key and connect again."
+    "Authentication failed for your saved connection. Reconnect and try again."
 )
 NEW_KEY_REJECTED_MESSAGE = (
-    "This API key isn't valid. Check that you copied the whole key, "
-    "or create a new one."
+    "Authentication failed. Check your connection details and try again."
 )
-CONNECTION_FAILED_MESSAGE = "Couldn't check your API key. Please try again."
+CONNECTION_FAILED_MESSAGE = "Couldn't connect to GeoDel. Please try again."
 
 
 class GeoDelPlugin:

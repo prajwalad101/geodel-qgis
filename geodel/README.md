@@ -85,4 +85,15 @@ Include plugin version, exact QGIS build, OS, steps and sanitized error text.
 This candidate has not been accepted into the official QGIS Plugin Repository.
 Use ZIP installation until an accepted Plugin Repository URL is recorded.
 
-GPL-3.0-or-later; see LICENSE and NOTICE.md.
+## License and resources
+
+Copyright (C) 2026 GeoDel contributors. Code, tests, scripts, and documentation
+are distributed under GPL-3.0-or-later; see LICENSE.
+
+The two-point sample dataset is invented by GeoDel contributors and is
+GPL-3.0-or-later. No third-party datasets are bundled.
+
+QGIS and Qt, including native networking, are supplied by the user's QGIS
+installation. They are not bundled or relicensed by this repository. Their
+respective licenses continue to apply. GeoDel is the product name; this license
+does not grant trademark rights.

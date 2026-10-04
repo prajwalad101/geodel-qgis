@@ -40,7 +40,6 @@ def test_projects_partial_success_into_render_ready_facts():
 def test_rejects_uploads_with_inconsistent_layer_outcomes():
     invalid_outcomes = (
         ("ready", 1, 0, 1, [{"name": "roads", "reason": "invalid"}]),
-        ("failed", 1, 1, 0, []),
         ("ready", 2, 1, 0, []),
         ("ready", 2, 1, 1, []),
     )

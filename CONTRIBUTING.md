@@ -20,7 +20,7 @@ the release notes.
 Never commit secrets, real customer datasets, credential stores, profiles,
 generated ZIPs, or dependencies. Preserve copyright and license notices.
 New code and resources must be compatible with GPL-3.0-or-later; document
-third-party resource provenance and licensing in `geodel/NOTICE.md`.
+third-party resource provenance and licensing in `geodel/README.md`.
 
 ## Contributor setup and checks
 

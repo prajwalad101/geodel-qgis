@@ -10,7 +10,7 @@ from zipfile import ZipFile
 
 PACKAGE_FILES = (
     "__init__.py", "auth_compat.py", "client.py", "config.py", "icon.svg",
-    "icon.png", "layer_export.py", "LICENSE", "metadata.txt", "NOTICE.md",
+    "icon.png", "layer_export.py", "LICENSE", "metadata.txt",
     "plugin.py", "recent_upload.py", "transport.py", "qgis_transport.py",
     "task_lifecycle.py", "dock.py", "tasks.py", "metadata.py", "README.md",
     "sample/places.geojson",
