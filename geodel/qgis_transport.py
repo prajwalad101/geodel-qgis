@@ -13,9 +13,10 @@ from time import monotonic
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlencode
 
-from qgis.PyQt import sip
-from qgis.PyQt.QtCore import QByteArray, QEventLoop, QThread, QTimer, QUrl
-from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest, QSslError
+from qgis.PyQt.QtCore import (
+    QByteArray, QCoreApplication, QEvent, QEventLoop, QObject, Qt, QThread, QTimer, QUrl, pyqtSignal,
+)
+from qgis.PyQt.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest, QSslError
 from qgis.core import QgsApplication, QgsNetworkAccessManager
 
 from .transport import Response, TransportCanceled, TransportError, TransportTimeout
@@ -127,6 +128,10 @@ if not _hooks.reply_identifier:
         lambda request, reply, hooks=_hooks: hooks.prepare_reply(request, reply))
 
 
+class _RequestCancellation(QObject):
+    requested = pyqtSignal()
+
+
 class QgisTransport:
     def request(
         self, method: str, url: str, *,
@@ -161,7 +166,11 @@ class QgisTransport:
         # setupDefaultProxyAndCache: that wires up shared cookies and auth dialogs.
         manager = QgsNetworkAccessManager()
         timer = QTimer()
-        reply = None
+        cancellation = _RequestCancellation(manager)
+        abort_connection = None
+        loop = None
+        result = None
+        reply_pending = False
         deadline = monotonic() + timeout
         expired = False
         canceled = False
@@ -170,16 +179,45 @@ class QgisTransport:
             nonlocal expired, canceled
             canceled = bool(is_canceled and is_canceled())
             expired = monotonic() >= deadline
-            if (canceled or expired) and reply is not None:
-                reply.abort()
+            if (canceled or expired) and reply_pending:
+                cancellation.requested.emit()
 
         def manager_timeout(_reply):
             nonlocal expired
             expired = True
 
-        manager.requestTimedOut[QNetworkReply].connect(manager_timeout)
+        def finished(completed_reply):
+            nonlocal reply_pending, result
+            reply_pending = False
+            # Snapshot the live reply supplied by Qt, before returning to the
+            # event loop. Never read or abort the returned wrapper afterward.
+            status = completed_reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+            response_headers = {
+                bytes(name).decode("latin-1"): bytes(completed_reply.rawHeader(name)).decode("latin-1")
+                for name in completed_reply.rawHeaderList()
+            }
+            result = (
+                Response(
+                    int(status or 0),
+                    bytes(completed_reply.readAll()) if completed_reply.isReadable() else b"",
+                    response_headers,
+                ),
+                completed_reply.error(),
+                completed_reply.attribute(QNetworkRequest.Attribute.RedirectionTargetAttribute),
+            )
+            if abort_connection is not None:
+                QObject.disconnect(abort_connection)
+            loop.quit()
+
+        # These callbacks access worker-owned Qt objects. Do not queue them
+        # past completion or destruction of the request's manager and reply.
+        manager.requestTimedOut[QNetworkReply].connect(manager_timeout, Qt.ConnectionType.DirectConnection)
+        # QgsNetworkAccessManager also declares finished(QgsNetworkReplyContent).
+        # Bind the base Qt signal explicitly to receive its live QNetworkReply.
+        manager_finished = QNetworkAccessManager.finished.__get__(manager, QNetworkAccessManager)
+        manager_finished.connect(finished, Qt.ConnectionType.DirectConnection)
         timer.setInterval(25)
-        timer.timeout.connect(check_request)
+        timer.timeout.connect(check_request, Qt.ConnectionType.DirectConnection)
         _request_scope.policy = policy
         timer.start()
         try:
@@ -190,6 +228,10 @@ class QgisTransport:
                     raise TransportCanceled("Request canceled")
                 if expired:
                     raise TransportTimeout("Request timed out")
+                loop = QEventLoop()
+                result = None
+                abort_connection = None
+                reply_pending = True
                 request = QNetworkRequest(next_url)
                 if method == "GET":
                     reply = manager.get(request)
@@ -199,37 +241,37 @@ class QgisTransport:
                     reply = manager.put(request, QByteArray(data or b""))
                 else:
                     reply = manager.deleteResource(request)
-                loop = QEventLoop()
-                reply.finished.connect(loop.quit)
-                if not reply.isFinished():
+                if result is None:
+                    # A native Qt connection stops targeting a deleted reply
+                    # automatically; a Python callback calling abort() does not.
+                    abort_connection = cancellation.requested.connect(reply.abort, Qt.ConnectionType.DirectConnection)
                     loop.exec()
-                reply.finished.disconnect(loop.quit)
                 if canceled or (is_canceled and is_canceled()):
                     raise TransportCanceled("Request canceled")
-                if expired or monotonic() >= deadline or reply.error() == QNetworkReply.NetworkError.TimeoutError:
+                if expired or monotonic() >= deadline:
                     raise TransportTimeout("Request timed out")
                 if policy.blocked:
                     raise TransportError("Unsafe or excessive redirect")
-                status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+                if result is None:
+                    raise TransportError("Network request ended without a response")
+                response, error, redirect = result
+                if error == QNetworkReply.NetworkError.TimeoutError:
+                    raise TransportTimeout("Request timed out")
                 # Qt reports HTTP 4xx/5xx as errors too; preserve status for the client.
-                if not status or (reply.error() != QNetworkReply.NetworkError.NoError and int(status) < 400):
+                if not response.status_code or (
+                    error != QNetworkReply.NetworkError.NoError and response.status_code < 400
+                ):
                     raise TransportError("Network or TLS failure")
-                redirect = reply.attribute(QNetworkRequest.Attribute.RedirectionTargetAttribute)
-                if redirect is not None and 300 <= int(status) < 400:
+                if redirect is not None and 300 <= response.status_code < 400:
                     next_url = policy.url.resolved(redirect)
-                    reply.deleteLater()
-                    reply = None
                     continue
-                response_headers = {
-                    bytes(name).decode("latin-1"): bytes(reply.rawHeader(name)).decode("latin-1")
-                    for name in reply.rawHeaderList()
-                }
-                return Response(int(status), bytes(reply.readAll()), response_headers)
+                return response
         finally:
             timer.stop()
             timer.timeout.disconnect(check_request)
             del _request_scope.policy
-            if reply is not None:
-                reply.abort()
+            if reply_pending:
+                cancellation.requested.emit()
             # Destroy in the worker thread, including replies and cached credentials.
-            sip.delete(manager)
+            manager.deleteLater()
+            QCoreApplication.sendPostedEvents(manager, QEvent.Type.DeferredDelete)
