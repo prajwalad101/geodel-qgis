@@ -1,7 +1,7 @@
 [general]
 name=GeoDel
 description=Upload and share GIS data without leaving QGIS.
-version=0.1.1
+version=0.1.2
 qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 author=GeoDel
@@ -14,4 +14,4 @@ category=Web
 icon=icon.png
 experimental=False
 tags=data sharing,cloud upload,geojson,shapefile,web maps
-changelog=0.1.1: Native QGIS networking, QGIS 3.44/4 compatibility, stable metadata, documented usage and validated reproducible release packaging.
+changelog=0.1.2: Fix recent uploads with retained ready layers and show accurate upload errors for workspace restrictions and other server failures.

@@ -27,7 +27,7 @@ def test_candidate_is_reproducible_and_checksum_matches(tmp_path):
     first = build(PROJECT, tmp_path / "one.zip")
     second = build(PROJECT, tmp_path / "two.zip")
     assert first.read_bytes() == second.read_bytes()
-    assert validate_package(first, PROJECT, tag="v0.1.1") == "0.1.1"
+    assert validate_package(first, PROJECT, tag="v0.1.2") == "0.1.2"
     import hashlib
     assert first.with_suffix(".zip.sha256").read_text() == (
         f"{hashlib.sha256(first.read_bytes()).hexdigest()}  one.zip\n"
