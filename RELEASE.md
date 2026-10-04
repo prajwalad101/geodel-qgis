@@ -62,3 +62,15 @@ References: [QGIS packaging](https://docs.qgis.org/3.44/en/docs/pyqgis_developer
 [QGIS 4 metadata](https://plugins.qgis.org/docs/migrate-qgis4),
 [security checks](https://plugins.qgis.org/docs/security-scanning/tools),
 [approval](https://plugins.qgis.org/docs/approval).
+
+## Retry a failed tag run
+
+After a workflow fix reaches `main`, open **Actions > Plugin tests > Run workflow**.
+Select `main` and enter the existing annotated tag (for example `v0.1.1`) in
+`release_tag`. This runs the current workflow against that tag's exact source
+commit, repeats all required checks, and creates a draft from the artifact
+produced in that same run. It does not move or recreate the release tag.
+
+Using **Re-run jobs** on an older failed run uses its older workflow definition.
+Remote tags must remain annotated, point to the tested commit, and belong to
+`main`. Existing releases are never overwritten.

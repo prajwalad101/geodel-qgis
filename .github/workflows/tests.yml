@@ -2,6 +2,12 @@ name: Plugin tests
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing annotated release tag to verify and package
+        required: true
+        type: string
 permissions:
   contents: read
 jobs:
@@ -9,8 +15,11 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -24,25 +33,29 @@ jobs:
         run: |
           version=$(python -c 'from geodel.metadata import PLUGIN_VERSION; print(PLUGIN_VERSION)')
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Build and validate committed package
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.version.outputs.commit }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           python scripts/build.py
-          python scripts/validate_package.py "dist/geodel-$VERSION.zip" --commit "$GITHUB_SHA"
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            python scripts/validate_package.py "dist/geodel-$VERSION.zip" --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
+          python scripts/validate_package.py "dist/geodel-$VERSION.zip" --commit "$SOURCE_COMMIT"
+          if [[ "$GITHUB_REF" == refs/tags/* || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            python scripts/validate_package.py "dist/geodel-$VERSION.zip" --tag "$RELEASE_TAG" --commit "$SOURCE_COMMIT"
           fi
           python -m zipfile -e "dist/geodel-$VERSION.zip" extracted
           python scripts/scan.py extracted/geodel
       - uses: actions/upload-artifact@v4
         with:
-          name: candidate-${{ github.sha }}
+          name: candidate-${{ steps.version.outputs.commit }}
           path: |
             dist/*.zip
             dist/*.zip.sha256
           if-no-files-found: error
   qgis-runtime:
+    needs: behavior
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -56,6 +69,8 @@ jobs:
             image: qgis/qgis@sha256:8996496c15887a8fae0da05fa38103093ddbf104525bcbd67bf733a914fb1444
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.behavior.outputs.commit }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -75,9 +90,12 @@ jobs:
               "$QGIS_IMAGE" scripts/test-qgis.py
           done
   qt6-checker:
+    needs: behavior
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.behavior.outputs.commit }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -92,37 +110,64 @@ jobs:
               scripts/check-qt6.py "$package"
           done
   draft-release:
-    if: startsWith(github.ref, 'refs/tags/v') && github.repository == 'prajwalad101/geodel-qgis'
+    if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && github.repository == 'prajwalad101/geodel-qgis'
     needs: [behavior, qgis-runtime, qt6-checker]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     concurrency:
-      group: draft-release-${{ github.ref }}
+      group: draft-release-${{ inputs.release_tag || github.ref_name }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.behavior.outputs.commit }}
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - uses: actions/download-artifact@v4
         with:
-          name: candidate-${{ github.sha }}
+          name: candidate-${{ needs.behavior.outputs.commit }}
           path: dist
-      - name: Verify same-run artifact, tag and main before draft upload
+      - name: Verify remote annotated tag and main
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+          SOURCE_COMMIT: ${{ needs.behavior.outputs.commit }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag must be vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          # Checkout can flatten an annotated tag locally. Fetch remote identity
+          # into a separate reference instead of trusting refs/tags from checkout.
+          git fetch --no-tags origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/tags/$RELEASE_TAG:refs/geodel-release/tag"
+          if [[ "$(git cat-file -t refs/geodel-release/tag)" != tag ]]; then
+            echo "::error::Remote release tag must be annotated"
+            exit 1
+          fi
+          tag_commit=$(git rev-parse "refs/geodel-release/tag^{commit}")
+          if [[ "$tag_commit" != "$SOURCE_COMMIT" ]]; then
+            echo "::error::Remote tag commit $tag_commit differs from tested commit $SOURCE_COMMIT"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$SOURCE_COMMIT" origin/main; then
+            echo "::error::Tested release commit is not on origin/main"
+            exit 1
+          fi
+          echo "Verified remote $RELEASE_TAG at tested commit $SOURCE_COMMIT on main"
+      - name: Verify same-run artifact and create draft
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.behavior.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.behavior.outputs.commit }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
-          git fetch origin main "refs/tags/$GITHUB_REF_NAME"
-          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = "tag"
-          test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
-          python scripts/validate_package.py "dist/geodel-$VERSION.zip" --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
+          python scripts/validate_package.py "dist/geodel-$VERSION.zip" --tag "$RELEASE_TAG" --commit "$SOURCE_COMMIT"
           (cd dist && sha256sum --check "geodel-$VERSION.zip.sha256")
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$RELEASE_TAG" \
             "dist/geodel-$VERSION.zip" "dist/geodel-$VERSION.zip.sha256" \
             --verify-tag --draft --title "GeoDel QGIS $VERSION" \
             --notes-file RELEASE.md
