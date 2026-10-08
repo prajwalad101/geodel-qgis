@@ -231,6 +231,248 @@ class PluginRuntimeTests(unittest.TestCase):
         self.assertTrue(self.plugin.dock.update_notice.isHidden())
         self.assertEqual(len(self.iface.toolbar.actions()), 1)
 
+    def prepare_file_upload(self):
+        self.plugin.initGui()
+        self.plugin.action.trigger()
+        self.patches.enter_context(patch.object(
+            self.plugin, "_load_api_key", return_value="synthetic-key",
+        ))
+        self.plugin.dock.set_organizations([{"id": "org-1", "name": "Test Workspace"}])
+        self.plugin.dock.show_connected()
+        wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+        source = Path(os.environ["GEODEL_RUNTIME_ROOT"]) / "roads.geojson"
+        source.write_text('{"type":"FeatureCollection","features":[]}')
+        self.plugin._choose_file(str(source))
+        self.assertTrue(self.plugin.dock.upload_button.isEnabled())
+        self.assertTrue(self.plugin.dock.cancel_upload_button.isHidden())
+        return source
+
+    def test_cancel_transfer_keeps_source_and_name_and_allows_retry(self):
+        from geodel.client import GeoDelClient, UploadCanceled
+        started, release = Event(), Event()
+        self.addCleanup(release.set)
+
+        def transfer(_path, _filename, _organization, _folder, _progress, is_canceled):
+            started.set()
+            release.wait(5)
+            if is_canceled():
+                raise UploadCanceled("Upload canceled")
+            return "upload-1"
+
+        with patch.object(GeoDelClient, "upload_file", side_effect=transfer) as upload:
+            source = self.prepare_file_upload()
+            dock = self.plugin.dock
+            dock.upload_button.click()
+            wait_until(started.is_set)
+            self.assertFalse(dock.cancel_upload_button.isHidden())
+            self.assertTrue(dock.cancel_upload_button.isEnabled())
+            self.assertFalse(dock.upload_button.isEnabled())
+            task = self.plugin._upload_task
+            dock.cancel_upload_button.click()
+            self.assertTrue(task.isCanceled())
+            self.assertFalse(dock.cancel_upload_button.isEnabled())
+            self.assertEqual(dock.status.text(), "Canceling upload…")
+            dock.cancel_upload_button.click()
+            release.set()
+            wait_until(lambda: self.plugin._upload_task is None)
+            self.assertEqual(dock.status.text(), "Upload canceled.")
+            self.assertEqual(self.plugin._selected_path, source)
+            self.assertEqual(dock.upload_name.text(), "roads")
+            self.assertTrue(dock.upload_button.isEnabled())
+            self.assertTrue(dock.cancel_upload_button.isHidden())
+            self.assertFalse(dock.progress.isVisible())
+            upload.side_effect = None
+            upload.return_value = "upload-2"
+            dock.upload_button.click()
+            wait_until(lambda: self.plugin._upload_task is None)
+            self.assertEqual(upload.call_count, 2)
+            self.assertIn("Uploaded.", dock.status.text())
+            self.assertIsNone(self.plugin._selected_path)
+
+    def test_cancel_layer_preparation_cleans_files_without_starting_transfer(self):
+        from tempfile import TemporaryDirectory
+        from geodel.client import GeoDelClient
+        from qgis.core import QgsFeature, QgsGeometry, QgsVectorLayer
+
+        self.prepare_file_upload()
+        project = QgsProject.instance()
+        self.addCleanup(project.clear)
+        directories = []
+
+        def temporary_export(**options):
+            directory = TemporaryDirectory(dir=os.environ["GEODEL_RUNTIME_ROOT"], **options)
+            directories.append(directory.name)
+            return directory
+
+        with patch("geodel.layer_export.TemporaryDirectory", side_effect=temporary_export), \
+                patch.object(GeoDelClient, "upload_file") as upload:
+            for count in (1, 2):
+                with self.subTest(layer_count=count):
+                    project.clear()
+                    for number in range(count):
+                        layer = QgsVectorLayer("Point?crs=EPSG:4326", f"roads-{number}", "memory")
+                        feature = QgsFeature(layer.fields())
+                        feature.setGeometry(QgsGeometry.fromWkt("POINT (1 2)"))
+                        layer.dataProvider().addFeatures([feature])
+                        layer.updateExtents()
+                        project.addMapLayer(layer)
+                    dock = self.plugin.dock
+                    for index in range(dock.layers.count()):
+                        dock.layers.item(index).setSelected(True)
+                    name = dock.upload_name.text()
+                    dock.upload_button.click()
+                    self.assertEqual(dock.upload_button.text(), "Preparing layers…")
+                    dock.cancel_upload_button.click()
+                    wait_until(lambda: self.plugin._upload_task is None)
+                    wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+                    upload.assert_not_called()
+                    self.assertEqual(dock.status.text(), "Upload canceled.")
+                    self.assertEqual(dock.upload_name.text(), name)
+                    self.assertEqual(len(dock.layers.selectedItems()), count)
+                    self.assertTrue(dock.upload_button.isEnabled())
+                    self.assertTrue(all(not Path(directory).exists() for directory in directories))
+
+    def test_many_layers_from_one_container_export_without_blocking_gui(self):
+        from zipfile import ZipFile
+        from geodel.client import GeoDelClient
+        from qgis.core import QgsFeature, QgsGeometry, QgsProviderRegistry, QgsVectorFileWriter, QgsVectorLayer
+
+        self.prepare_file_upload()
+        project = QgsProject.instance()
+        self.addCleanup(project.clear)
+        root = Path(os.environ["GEODEL_RUNTIME_ROOT"])
+        gpkg = root / "shared-layers.gpkg"
+        memory = QgsVectorLayer("Point?crs=EPSG:3857&field=label:string", "synthetic", "memory")
+        feature = QgsFeature(memory.fields())
+        feature.setAttributes(["synthetic"])
+        feature.setGeometry(QgsGeometry.fromWkt("POINT (1113194.9079327357 0)"))
+        memory.dataProvider().addFeatures([feature])
+        for index in range(18):
+            options = QgsVectorFileWriter.SaveVectorOptions()
+            options.driverName = "GPKG"
+            options.layerName = f"layer-{index}"
+            options.actionOnExistingFile = (
+                QgsVectorFileWriter.ActionOnExistingFile.CreateOrOverwriteLayer if index else
+                QgsVectorFileWriter.ActionOnExistingFile.CreateOrOverwriteFile
+            )
+            result = QgsVectorFileWriter.writeAsVectorFormatV3(memory, str(gpkg), project.transformContext(), options)
+            self.assertEqual(result[0], QgsVectorFileWriter.WriterError.NoError, result)
+
+        kmz = root / "shared-layers.kmz"
+        folders = "".join(
+            f"<Folder><name>layer-{index}</name><Placemark><name>synthetic</name>"
+            "<Point><coordinates>10,0,0</coordinates></Point></Placemark></Folder>"
+            for index in range(18)
+        )
+        with ZipFile(kmz, "w") as archive:
+            archive.writestr("doc.kml", '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>' + folders + "</Document></kml>")
+
+        artifacts = []
+        def uploaded(path, _filename, _org, _folder=None, _progress=None, _canceled=None):
+            artifacts.append(Path(path))
+            with ZipFile(path) as archive:
+                shapefiles = [name for name in archive.namelist() if name.endswith(".shp")]
+                self.assertEqual(len(shapefiles), 18)
+                for name in shapefiles:
+                    output = QgsVectorLayer(f"/vsizip/{path}/{name}", name, "ogr")
+                    self.assertTrue(output.isValid())
+                    self.assertEqual(output.featureCount(), 1)
+                    self.assertEqual(output.crs().authid(), "EPSG:4326")
+                    point = next(output.getFeatures()).geometry().asPoint()
+                    self.assertAlmostEqual(point.x(), 10, places=5)
+                    self.assertAlmostEqual(point.y(), 0, places=5)
+            return "uploaded"
+
+        with patch.object(GeoDelClient, "upload_file", side_effect=uploaded) as upload:
+            for container in (gpkg, kmz):
+                with self.subTest(format=container.suffix):
+                    project.clear()
+                    details = QgsProviderRegistry.instance().querySublayers(str(container))
+                    for detail in details:
+                        layer = QgsVectorLayer(detail.uri(), detail.name(), "ogr")
+                        if layer.isValid() and layer.isSpatial() and layer.featureCount() > 0:
+                            project.addMapLayer(layer)
+                    self.assertEqual(len(project.mapLayers()), 18)
+                    dock = self.plugin.dock
+                    for index in range(dock.layers.count()):
+                        dock.layers.item(index).setSelected(True)
+                    started = time.monotonic()
+                    dock.upload_button.click()
+                    self.assertLess(time.monotonic() - started, 1, "Upload click must not block the GUI")
+                    self.assertTrue(dock.cancel_upload_button.isEnabled())
+                    wait_until(lambda: self.plugin._upload_task is None)
+                    self.assertIn("Uploaded.", dock.status.text())
+                    self.assertFalse(artifacts[-1].parent.exists())
+            self.assertEqual(upload.call_count, 2)
+
+    def test_cancel_export_handoff_does_not_upload_completed_artifact(self):
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from geodel.client import GeoDelClient
+        from qgis.core import QgsTask
+
+        self.prepare_file_upload()
+        directory = TemporaryDirectory(dir=os.environ["GEODEL_RUNTIME_ROOT"])
+        self.addCleanup(directory.cleanup)
+        artifact = SimpleNamespace(path=Path(directory.name) / "export.geojson", cleanup=Mock(wraps=directory.cleanup))
+        artifact.path.write_text("{}")
+        task = QgsTask.fromFunction("Completed export", lambda _task: None)
+        self.plugin._upload_task = task
+        self.plugin.dock.set_uploading(True)
+        self.plugin.dock.cancel_upload_button.click()
+        with patch.object(GeoDelClient, "upload_file") as upload:
+            self.plugin._layer_export_finished(
+                task, self.plugin._connection_version, "export.geojson",
+                {"server_url": "https://example.com"}, None, artifact,
+            )
+            upload.assert_not_called()
+        artifact.cleanup.assert_called_once()
+        self.assertFalse(artifact.path.exists())
+        self.assertIsNone(self.plugin._upload_task)
+        self.assertEqual(self.plugin.dock.status.text(), "Upload canceled.")
+
+    def test_registered_upload_wins_cancel_completion_race(self):
+        from qgis.core import QgsTask
+
+        self.prepare_file_upload()
+        task = QgsTask.fromFunction("Completed upload", lambda _task: None)
+        self.plugin._upload_task = task
+        self.plugin.dock.set_uploading(True)
+        self.plugin.dock.cancel_upload_button.click()
+        self.plugin._upload_finished(
+            task, self.plugin._connection_version, "https://example.com", None, "upload-1",
+        )
+        self.assertIn("Uploaded.", self.plugin.dock.status.text())
+        self.assertIsNone(self.plugin._selected_path)
+        self.assertTrue(self.plugin.dock.cancel_upload_button.isHidden())
+
+    def test_unload_during_canceled_transfer_ignores_late_completion(self):
+        from geodel.client import GeoDelClient, UploadCanceled
+        started, release = Event(), Event()
+        self.addCleanup(release.set)
+
+        def transfer(_path, _filename, _organization, _folder, _progress, is_canceled):
+            started.set()
+            release.wait(5)
+            if is_canceled():
+                raise UploadCanceled("Upload canceled")
+            return "upload-1"
+
+        with patch.object(GeoDelClient, "upload_file", side_effect=transfer):
+            self.prepare_file_upload()
+            self.plugin.dock.upload_button.click()
+            wait_until(started.is_set)
+            task = self.plugin._upload_task
+            self.plugin.dock.cancel_upload_button.click()
+            self.plugin.unload()
+            self.assertTrue(task.isCanceled())
+            release.set()
+            wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+            self.plugin.initGui()
+            self.assertTrue(self.plugin.dock.cancel_upload_button.isHidden())
+            self.assertIsNone(self.plugin._upload_task)
+
     def test_queued_signal_from_old_dock_cannot_connect_reloaded_plugin(self):
         self.plugin.initGui()
         dock = self.plugin.dock

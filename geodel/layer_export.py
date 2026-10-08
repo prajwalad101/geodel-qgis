@@ -34,6 +34,9 @@ class LayerExport:
     def __init__(self, layers):
         self.layers = list(layers)
         self._error = None
+        self._artifact = None
+        self._output_paths = []
+        self._next_layer = 0
         if len(self.layers) > MAX_LAYERS:
             raise GeoDelError(f"Choose no more than {MAX_LAYERS} layers.")
         for layer in self.layers:
@@ -48,14 +51,23 @@ class LayerExport:
     def suffix(self):
         return ".geojson" if len(self.layers) == 1 else ".zip"
 
+    @property
+    def has_more_layers(self):
+        return self._next_layer < len(self.layers)
+
     def create_task(self, on_finished):
-        directory = TemporaryDirectory(prefix="geodel-")
-        root = Path(directory.name)
-        artifact = UploadArtifact(directory, root / f"upload{self.suffix}", self.suffix)
-        output_paths = [
-            artifact.path if self.suffix == ".geojson" else root / f"{stem}.shp"
-            for stem in _export_stems(self.layers)
-        ]
+        if self._artifact is None:
+            directory = TemporaryDirectory(prefix="geodel-")
+            root = Path(directory.name)
+            self._artifact = UploadArtifact(directory, root / f"upload{self.suffix}", self.suffix)
+            self._output_paths = [
+                self._artifact.path if self.suffix == ".geojson" else root / f"{stem}.shp"
+                for stem in _export_stems(self.layers)
+            ]
+        artifact = self._artifact
+        index = self._next_layer
+        layer = self.layers[index]
+        output_path = self._output_paths[index]
 
         completed = False
 
@@ -75,35 +87,39 @@ class LayerExport:
             self._prepare,
             on_finished=finished,
             artifact=artifact,
-            output_paths=output_paths,
+            output_paths=self._output_paths,
+            final=index == len(self.layers) - 1,
         )
+        task.setDependentLayers(self.layers)
         driver = "GeoJSON" if self.suffix == ".geojson" else "ESRI Shapefile"
-        for layer, output_path in zip(self.layers, output_paths):
-            options = QgsVectorFileWriter.SaveVectorOptions()
-            options.driverName = driver
-            options.fileEncoding = "UTF-8"
-            options.ct = QgsCoordinateTransform(
-                layer.crs(), TARGET_CRS, QgsProject.instance()
+        options = QgsVectorFileWriter.SaveVectorOptions()
+        options.driverName = driver
+        options.fileEncoding = "UTF-8"
+        options.ct = QgsCoordinateTransform(
+            layer.crs(), TARGET_CRS, QgsProject.instance()
+        )
+        # Writer construction opens an iterator on the GUI thread. Preparing
+        # every layer first exhausts shared GPKG/KMZ connection pools and deadlocks.
+        writer = QgsVectorFileWriterTask(layer, str(output_path), options)
+        writer.setDescription(f"Export {layer.name()} for {PRODUCT_NAME}")
+        writer.setDependentLayers([layer])
+        writer.errorOccurred.connect(
+            lambda code, message, layer_name=layer.name(): self._record_error(
+                code, layer_name, message
             )
-            writer = QgsVectorFileWriterTask(layer, str(output_path), options)
-            writer.setDescription(f"Export {layer.name()} for {PRODUCT_NAME}")
-            writer.setDependentLayers([layer])
-            writer.errorOccurred.connect(
-                lambda code, message, layer_name=layer.name(): self._record_error(
-                    code, layer_name, message
-                )
-            )
-            task.addSubTask(
-                writer, [], QgsTask.SubTaskDependency.ParentDependsOnSubTask
-            )
+        )
+        task.addSubTask(writer, [], QgsTask.SubTaskDependency.ParentDependsOnSubTask)
+        self._next_layer += 1
         task.taskTerminated.connect(lambda: finished(None, None))
         return task
 
-    def _prepare(self, task, artifact, output_paths):
+    def _prepare(self, task, artifact, output_paths, final):
         if task.isCanceled():
             return None
         if self._error:
             raise GeoDelError(self._error)
+        if not final:
+            return artifact
         for layer, output_path in zip(self.layers, output_paths):
             try:
                 has_features = (

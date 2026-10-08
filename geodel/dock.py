@@ -488,6 +488,7 @@ class GeoDelDockWidget(QDockWidget):
         file_layout.addStretch()
         file_page = QWidget()
         file_page.setLayout(file_layout)
+
         self.source_pages = QStackedWidget()
         self.source_pages.addWidget(layers_page)
         self.source_pages.addWidget(file_page)
@@ -495,19 +496,27 @@ class GeoDelDockWidget(QDockWidget):
         self.upload_name = QLineEdit()
         self.upload_name.setPlaceholderText(f"Name shown in {PRODUCT_NAME}")
         self.upload_name.setAccessibleName(f"{PRODUCT_NAME} upload name")
+
         self.upload_button = QPushButton(f"Upload to {PRODUCT_NAME}")
         self.upload_button.setProperty("variant", "primary")
         self.upload_button.setEnabled(False)
+
+        self.cancel_upload_button = QPushButton("Cancel upload")
+        self.cancel_upload_button.setAccessibleName("Cancel upload")
+        self.cancel_upload_button.setVisible(False)
+
         self.progress = QProgressBar()
         self.progress.setTextVisible(False)
         self.progress.setRange(0, 100)
         self.progress.hide()
+
         self.status = _label("", "muted")
         self.status.setWordWrap(True)
 
         self.recent_uploads = RecentUploadsList()
         self.recent_uploads.setAccessibleName(f"Recent {PRODUCT_NAME} uploads")
         self.recent_uploads.setMinimumHeight(260)
+
         self.recent_count = _label("", "muted")
         self.recent_status = _label(
             "Choose a workspace to load recent uploads.", "muted"
@@ -531,7 +540,10 @@ class GeoDelDockWidget(QDockWidget):
         main_layout.addWidget(_label("NAME", "section"))
         main_layout.addWidget(self.upload_name)
         main_layout.addSpacing(4)
-        main_layout.addWidget(self.upload_button)
+        upload_actions = QHBoxLayout()
+        upload_actions.addWidget(self.upload_button, 1)
+        upload_actions.addWidget(self.cancel_upload_button)
+        main_layout.addLayout(upload_actions)
         main_layout.addWidget(self.progress)
         main_layout.addWidget(self.status)
         main_layout.addLayout(recent_row)
@@ -663,6 +675,9 @@ class GeoDelDockWidget(QDockWidget):
         self.upload_button.setText(
             "Uploading…" if uploading else f"Upload to {PRODUCT_NAME}"
         )
+        self.cancel_upload_button.setVisible(uploading)
+        self.cancel_upload_button.setEnabled(uploading)
+        self.cancel_upload_button.setText("Cancel upload")
         self.progress.setValue(0)
         self.progress.setVisible(uploading)
         if uploading:

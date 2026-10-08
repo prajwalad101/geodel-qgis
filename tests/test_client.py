@@ -1,4 +1,4 @@
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import json
@@ -16,12 +16,18 @@ from geodel.client import (
 )
 
 
+@pytest.fixture(autouse=True)
+def multipart_policy(monkeypatch):
+    # These legacy cases exercise multipart cleanup; single PUT has its own tests.
+    monkeypatch.setattr("geodel.client.SINGLE_PUT_THRESHOLD", 0)
+
+
 def response(status_code, payload, headers=None):
     return Response(status_code, json.dumps(payload).encode(), headers or {})
 
 
 def test_lists_organizations_with_plugin_auth_headers():
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(
         200,
         {"organizations": [{"id": "org-1", "name": "Field Team"}]},
@@ -47,7 +53,7 @@ def test_lists_organizations_with_plugin_auth_headers():
 
 
 def test_unauthorized_response_reports_authentication_failure_without_guessing_cause():
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(401, {"message": "Unauthorized"})
     client = GeoDelClient(
         "https://example.com",
@@ -62,7 +68,7 @@ def test_unauthorized_response_reports_authentication_failure_without_guessing_c
 
 
 def test_forbidden_response_is_not_reported_as_revoked_key():
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(403, {"message": "Forbidden"})
     client = GeoDelClient(
         "https://example.com",
@@ -84,7 +90,7 @@ def test_forbidden_response_is_not_reported_as_revoked_key():
     None,
 ])
 def test_generic_forbidden_response_does_not_guess_why_request_was_denied(payload):
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(403, payload)
     client = GeoDelClient("https://example.com", "key", "0.1.0", transport=transport)
 
@@ -101,7 +107,7 @@ def test_generic_forbidden_response_does_not_guess_why_request_was_denied(payloa
     ("subscription_required", "Your workspace needs a subscription to upload files."),
 ])
 def test_explicit_workspace_restriction_reason_reports_known_cause(reason, message):
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(403, {"reason": reason})
     client = GeoDelClient("https://example.com", "key", "0.1.0", transport=transport)
 
@@ -111,7 +117,7 @@ def test_explicit_workspace_restriction_reason_reports_known_cause(reason, messa
 
 
 def test_server_error_uses_http_failure():
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(500, {"message": "Server error"})
     client = GeoDelClient(
         "https://example.com",
@@ -128,7 +134,7 @@ def test_server_error_uses_http_failure():
 
 def test_api_errors_use_configured_product_name(monkeypatch):
     monkeypatch.setattr("geodel.client.PRODUCT_NAME", "Maply")
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(500, {"message": "Server error"})
     client = GeoDelClient(
         "https://example.com",
@@ -164,7 +170,7 @@ def test_api_errors_use_configured_product_name(monkeypatch):
     (400, {"reason": "trial_expired"}, "GeoDel request failed (HTTP 400)."),
 ])
 def test_http_failure_messages_use_only_identified_server_causes(status, payload, message):
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(status, payload)
     client = GeoDelClient("https://example.com", "key", "0.1.0", transport=transport)
 
@@ -178,7 +184,7 @@ def test_http_failure_messages_use_only_identified_server_causes(status, payload
 
 @pytest.mark.parametrize("status", [400, 403, 500])
 def test_http_failure_with_non_json_body_has_generic_message(status):
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = Response(status, b"<html>unknown server error</html>")
     client = GeoDelClient("https://example.com", "key", "0.1.0", transport=transport)
 
@@ -194,7 +200,7 @@ def test_http_failure_with_non_json_body_has_generic_message(status):
     [("0.1.0", False), ("0.2.0", True), ("0.1.1", True)],
 )
 def test_meta_version_gate(minimum, requires_update):
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(
         200, {"minPluginVersion": minimum, "pluginVersion": "0.1.0"}
     )
@@ -219,7 +225,7 @@ def test_meta_version_gate(minimum, requires_update):
 def test_version_gate_identifies_invalid_version_source(
     plugin_version, minimum, message
 ):
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(200, {"minPluginVersion": minimum})
     client = GeoDelClient(
         "https://example.com",
@@ -233,7 +239,7 @@ def test_version_gate_identifies_invalid_version_source(
 
 
 def test_lists_folders_for_selected_organization():
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(
         200,
         {
@@ -263,7 +269,7 @@ def test_lists_folders_for_selected_organization():
     {"id": "folder-1", "name": 1},
 ])
 def test_rejects_invalid_folders(folder):
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(200, {"folders": [folder]})
     client = GeoDelClient("https://example.com", "key", "0.1.0", transport=transport)
     with pytest.raises(GeoDelError, match="invalid folders response"):
@@ -289,7 +295,7 @@ def test_lists_recent_uploads_with_owner_summary():
             },
         }
     ]
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(200, {"uploads": uploads})
     client = GeoDelClient(
         "https://example.com",
@@ -309,7 +315,7 @@ def test_lists_recent_uploads_with_owner_summary():
 
 @pytest.mark.parametrize("summary", [{}, [], "invalid"])
 def test_recent_uploads_reject_malformed_layer_summary(summary):
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(200, {"uploads": [{
         "id": "upload-1",
         "originalFilename": "roads.zip",
@@ -338,7 +344,7 @@ def test_recent_uploads_include_failed_upload_with_retained_ready_layer():
         }
         for index in range(10)
     ]
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(200, {"uploads": uploads})
     client = GeoDelClient("https://example.com", "key", "0.1.0", transport=transport)
 
@@ -354,58 +360,23 @@ def test_recent_uploads_include_failed_upload_with_retained_ready_layer():
 
 
 def test_multipart_upload_sends_original_bytes_and_reports_progress(tmp_path):
+    from test_upload_efficiency import UploadTransport
+
     source = tmp_path / "roads.geojson"
     original = b"a" * PART_SIZE + b"last byte"
     source.write_bytes(original)
-    transport = Mock(spec=Transport)
-    transport.request.side_effect = [
-        response(
-            200,
-            {"attemptId": "attempt-1", "key": "attempt-1", "uploadId": "attempt-1"},
-        ),
-        response(200, {"url": "https://storage.example.com/part-1"}),
-        response(200, None, {"ETag": '"etag-1"'}),
-        response(200, {"url": "https://storage.example.com/part-2"}),
-        response(200, None, {"ETag": '"etag-2"'}),
-        response(200, {"key": "attempt-1"}),
-        response(200, {"id": "upload-1"}),
-    ]
+    transport = UploadTransport()
     progress = []
-    client = GeoDelClient(
-        "https://example.com",
-        "geodel_secret",
-        "0.1.0",
-        transport=transport,
-    )
-
-    upload_id = client.upload_file(
-        source,
-        "Client roads.geojson",
-        "org-1",
-        "folder-1",
-        progress.append,
-    )
-
-    assert upload_id == "upload-1"
-    assert transport.request.call_args_list[2].args == (
-        "PUT",
-        "https://storage.example.com/part-1",
-    )
-    uploaded = (
-        transport.request.call_args_list[2].kwargs["data"]
-        + transport.request.call_args_list[4].kwargs["data"]
-    )
-    assert uploaded == original
-    assert transport.request.call_args_list[6].kwargs["json"] == {
-        "attemptId": "attempt-1",
-        "folderId": "folder-1",
-    }
-    assert len(progress) == 2
+    client = GeoDelClient("https://example.com", "geodel_secret", "0.1.0", transport)
+    assert client.upload_file(source, "Client roads.geojson", "org-1", "folder-1", progress.append) == "upload"
+    assert transport.parts["/1"] + transport.parts["/2"] == original
+    assert transport.calls[-1][2]["json"] == {"attemptId": "attempt", "folderId": "folder-1"}
+    assert progress == sorted(progress)
     assert progress[-1] == 100.0
 
 
 def test_reads_upload_status_and_share_token():
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.side_effect = [
         response(
             200,
@@ -439,7 +410,7 @@ def test_publishes_file_until_share_link_is_ready(tmp_path):
         "https://example.com",
         "geodel_secret",
         "0.1.0",
-        transport=Mock(spec=Transport),
+        transport=MagicMock(spec=Transport),
     )
     client.upload_file = Mock(
         side_effect=lambda *args: (args[4](50), "upload-1")[1]
@@ -472,7 +443,7 @@ def test_publish_retries_transient_status_and_share_link_errors(tmp_path):
         "https://example.com",
         "geodel_secret",
         "0.1.0",
-        transport=Mock(spec=Transport),
+        transport=MagicMock(spec=Transport),
     )
     client.upload_file = Mock(return_value="upload-1")
     processing = {
@@ -507,7 +478,7 @@ def test_publish_cancels_while_waiting_for_processing(tmp_path):
         "https://example.com",
         "geodel_secret",
         "0.1.0",
-        transport=Mock(spec=Transport),
+        transport=MagicMock(spec=Transport),
     )
     client.upload_file = Mock(return_value="upload-1")
     client.get_upload_status = Mock(
@@ -534,7 +505,7 @@ def test_publish_returns_timeout_outcome(tmp_path):
         "https://example.com",
         "geodel_secret",
         "0.1.0",
-        transport=Mock(spec=Transport),
+        transport=MagicMock(spec=Transport),
     )
     client.upload_file = Mock(return_value="upload-1")
     client.get_upload_status = Mock(
@@ -561,7 +532,7 @@ def test_rejects_file_over_max_size_before_request(tmp_path):
     source = tmp_path / "too-large.zip"
     with source.open("wb") as file:
         file.truncate(MAX_FILE_SIZE + 1)
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     client = GeoDelClient(
         "https://example.com",
         "geodel_secret",
@@ -569,14 +540,14 @@ def test_rejects_file_over_max_size_before_request(tmp_path):
         transport=transport,
     )
 
-    with pytest.raises(GeoDelError, match="60 MB"):
+    with pytest.raises(GeoDelError, match="200 MB"):
         client.upload_file(source, "too-large.zip", "org-1")
 
     transport.request.assert_not_called()
 
 
 def test_unreachable_server_raises_server_unavailable_error():
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.side_effect = TransportError("DNS failure")
     client = GeoDelClient(
         "https://example.com", "geodel_secret", "0.1.0", transport=transport
@@ -587,7 +558,7 @@ def test_unreachable_server_raises_server_unavailable_error():
 
 
 def test_server_error_raises_server_unavailable_error():
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(503, {"message": "Unavailable"})
     client = GeoDelClient(
         "https://example.com", "geodel_secret", "0.1.0", transport=transport
@@ -598,7 +569,7 @@ def test_server_error_raises_server_unavailable_error():
 
 
 def test_rejected_key_is_not_server_unavailable():
-    transport = Mock(spec=Transport)
+    transport = MagicMock(spec=Transport)
     transport.request.return_value = response(401, {"message": "Unauthorized"})
     client = GeoDelClient("https://example.com", "geodel_bad", "0.1.0", transport=transport)
 

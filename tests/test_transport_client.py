@@ -1,10 +1,18 @@
 """Client behavior at the injected HTTP boundary, without QGIS imports."""
 import json
 
+import pytest
+from geodel.transport import Transport
+
 from geodel.client import GeoDelClient
 
 
-class FixtureTransport:
+@pytest.fixture(autouse=True)
+def multipart_policy(monkeypatch):
+    monkeypatch.setattr("geodel.client.SINGLE_PUT_THRESHOLD", 0)
+
+
+class FixtureTransport(Transport):
     def __init__(self, *outcomes):
         self.outcomes = list(outcomes)
         self.calls = []
@@ -41,7 +49,8 @@ def test_canceled_part_attempts_cleanup_without_canceled_feedback(tmp_path):
     class CancelDuringPart(FixtureTransport):
         def request(self, method, url, **options):
             if method == "PUT":
-                assert options["is_canceled"] is canceled
+                assert not options["is_canceled"]()
+                assert options["timeout"] == 300
                 raise TransportCanceled("canceled")
             if method == "DELETE":
                 assert not options["is_canceled"]()
@@ -189,3 +198,41 @@ def test_constructor_cancellation_stops_processing_wait(tmp_path):
     with patch("geodel.client.sleep", side_effect=AssertionError("Canceled tasks must not wait")):
         with pytest.raises(UploadCanceled):
             client.publish_file(source, source.name, "workspace-1")
+
+
+def test_upload_accepts_exactly_200_mib_in_10_mib_parts(tmp_path):
+    from geodel.transport import Response
+
+    class MultipartTransport(Transport):
+        def __init__(self):
+            self.parts = []
+            self.completed = None
+
+        def request(self, method, url, **options):
+            if method == "PUT":
+                assert options["timeout"] == 300
+                assert options.get("headers", {}) == {}
+                self.parts.append(len(options["data"]))
+                return Response(200, headers={"ETag": f'"part-{url.rsplit("/", 1)[1]}"'})
+            assert options["timeout"] == 15
+            if url.endswith("/s3/multipart"):
+                assert options["json"]["metadata"]["fileSizeKb"] == 200 * 1024
+                return Response(200, b'{"uploadId":"attempt-1","key":"storage-key"}')
+            if url.endswith("/complete"):
+                self.completed = options["json"]["parts"]
+                return Response(200, b'{}')
+            if url.endswith("/register"):
+                return Response(200, b'{"id":"upload-1"}')
+            return Response(200, json.dumps({"url": "https://storage.example.com/" + url.rsplit("/", 1)[1]}).encode())
+
+    source = tmp_path / "large.zip"
+    with source.open("wb") as stream:
+        stream.truncate(200 * 1024 * 1024)
+    transport = MultipartTransport()
+    client = GeoDelClient("https://example.com", "synthetic-key", "0.1.1", transport)
+    assert client.upload_file(source, source.name, "workspace-1") == "upload-1"
+    assert transport.parts == [10 * 1024 * 1024] * 20
+    assert transport.completed == [
+        {"PartNumber": number, "ETag": f'"part-{number}"'}
+        for number in range(1, 21)
+    ]

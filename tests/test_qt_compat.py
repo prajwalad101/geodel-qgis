@@ -327,6 +327,7 @@ def test_layer_export_keeps_original_connection_version():
 
     class Plugin:
         _upload_task = task
+        _upload_cancel_requested = False
 
         def _new_upload_task(self, _path, _name, _destination, version, **_kwargs):
             versions.append(version)
