@@ -1,7 +1,11 @@
 """QGIS-independent HTTP boundary for the domain client."""
 from dataclasses import dataclass, field
+from contextlib import nullcontext
 import json
-from typing import Any, Callable, Dict, Mapping, Optional, Protocol
+import os
+from pathlib import Path
+from os import stat_result
+from typing import Any, Callable, ContextManager, Dict, Mapping, Optional, Protocol, Union
 
 
 class TransportError(Exception):
@@ -12,8 +16,21 @@ class TransportTimeout(TransportError):
     """The request's deadline expired."""
 
 
+class TransportConnectionError(TransportError):
+    """Transient connection failure; safe to retry idempotent requests."""
+
+
 class TransportCanceled(TransportError):
     """The caller canceled the request."""
+
+
+def validate_upload_file(path, expected, descriptor=None):
+    def identity(stat):
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+    if (identity(path.stat()) != identity(expected)
+            or (descriptor is not None and identity(os.fstat(descriptor)) != identity(expected))):
+        raise OSError("Upload file changed during transfer")
 
 
 @dataclass(frozen=True)
@@ -31,12 +48,17 @@ class Response:
 
 
 class Transport(Protocol):
+    def session(self) -> ContextManager[None]:
+        return nullcontext()
+
     def request(
         self, method: str, url: str, *,
         headers: Optional[Mapping[str, str]] = None,
         params: Optional[Dict[str, Any]] = None,
         json: Optional[Dict[str, Any]] = None,
-        data: Optional[bytes] = None,
+        data: Optional[Union[bytes, Path]] = None,
+        file_stat: Optional[stat_result] = None,
         timeout: float = 15,
         is_canceled: Optional[Callable[[], bool]] = None,
+        upload_progress: Optional[Callable[[int], None]] = None,
     ) -> Response: ...

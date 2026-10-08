@@ -1,11 +1,18 @@
 """Pure-Python client for the QGIS plugin API."""
 
+from concurrent.futures import ThreadPoolExecutor
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from queue import Empty, Queue
+from secrets import randbelow
+from threading import Event, Lock
 from time import monotonic, sleep
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .transport import (
-    Response, Transport, TransportCanceled, TransportError,
+    Response, Transport, TransportCanceled, TransportConnectionError, TransportError, TransportTimeout,
+    validate_upload_file,
 )
 
 from .config import PRODUCT_NAME
@@ -13,8 +20,12 @@ from .recent_upload import RecentUpload, project_recent_upload
 
 
 PART_SIZE = 10 * 1024 * 1024
-MAX_FILE_SIZE = 60 * 1024 * 1024
+SINGLE_PUT_THRESHOLD = 100 * 1024 * 1024
+PART_CONCURRENCY = 3
+RETRY_DELAYS = (1, 3, 5)
+MAX_FILE_SIZE = 200 * 1024 * 1024
 MAX_FILE_SIZE_LABEL = f"{MAX_FILE_SIZE // (1024 * 1024)} MB"
+UPLOAD_PART_TIMEOUT_SECONDS = 5 * 60
 POLL_TIMEOUT_SECONDS = 10 * 60
 
 
@@ -137,91 +148,140 @@ class GeoDelClient:
         if is_canceled and is_canceled():
             raise UploadCanceled("Upload canceled")
 
-        initialized = self._request(
-            "POST",
-            "/uploads/s3/multipart",
-            organization_id,
-            is_canceled=is_canceled,
-            json={
-                "filename": filename,
-                "type": content_type,
-                "metadata": {
-                    "fileSizeKb": (file_size + 1023) // 1024,
-                    "lastModified": int(file_stat.st_mtime * 1000),
-                    "format": upload_format,
-                },
-            },
-        )
-        upload_id = initialized.get("uploadId")
-        key = initialized.get("key")
-        if not isinstance(upload_id, str) or not isinstance(key, str):
-            raise GeoDelError(
-                f"{PRODUCT_NAME} returned an invalid multipart response"
-            )
+        metadata = {
+            "fileSizeKb": (file_size + 1023) // 1024,
+            "lastModified": int(file_stat.st_mtime * 1000),
+            "format": upload_format,
+        }
+        progress_lock = Lock()
+        sent: Dict[int, int] = {}
 
-        parts = []
-        uploaded = 0
-        try:
-            with path.open("rb") as source:
-                for part_number, chunk in enumerate(
-                    iter(lambda: source.read(PART_SIZE), b""), 1
-                ):
-                    if is_canceled and is_canceled():
-                        raise UploadCanceled("Upload canceled")
-                    signed = self._get(
-                        f"/uploads/s3/multipart/{upload_id}/{part_number}",
-                        organization_id,
-                        params={"key": key},
-                        is_canceled=is_canceled,
-                    )
-                    url = signed.get("url")
-                    if not isinstance(url, str):
-                        raise GeoDelError(
-                            f"{PRODUCT_NAME} returned an invalid part upload URL"
-                        )
-                    etag = self._put_part(url, chunk, is_canceled)
-                    parts.append({"PartNumber": part_number, "ETag": etag})
-                    uploaded += len(chunk)
-                    if progress:
-                        progress(uploaded / file_size * 100)
+        def report(part_number, size, uploaded):
+            if progress:
+                with progress_lock:
+                    sent[part_number] = max(sent.get(part_number, 0), min(size, max(0, uploaded)))
+                    progress(min(99, sum(sent.values()) / file_size * 100))
 
-            self._request(
-                "POST",
-                f"/uploads/s3/multipart/{upload_id}/complete",
-                organization_id,
-                params={"key": key},
-                json={"parts": parts},
-                is_canceled=is_canceled,
-            )
-            registered = self._request(
-                "POST",
-                "/uploads/register",
-                organization_id,
-                is_canceled=is_canceled,
-                json={
-                    "attemptId": upload_id,
-                    **({"folderId": folder_id} if folder_id else {}),
-                },
-            )
-            registered_id = registered.get("id")
-            if not isinstance(registered_id, str):
-                raise GeoDelError(f"{PRODUCT_NAME} returned an invalid upload response")
-        except (GeoDelError, OSError) as error:
-            try:
-                self._request(
-                    "DELETE",
-                    f"/uploads/s3/multipart/{upload_id}",
-                    organization_id,
-                    params={"key": key},
-                    is_canceled=lambda: False,
+        with self.transport.session():
+            if file_size <= SINGLE_PUT_THRESHOLD:
+                signed = self._get(
+                    "/uploads/s3/params", organization_id,
+                    params={"filename": filename, "type": content_type,
+                            **{f"metadata[{name}]": value for name, value in metadata.items()}},
+                    is_canceled=is_canceled,
                 )
-            except GeoDelError:
-                pass
-            if isinstance(error, GeoDelError):
-                raise
-            raise GeoDelError(f"Could not read upload file: {error}") from error
-
+                attempt_id = signed.get("attemptId")
+                if not isinstance(attempt_id, str) or not attempt_id or signed.get("method") != "PUT":
+                    raise GeoDelError(f"{PRODUCT_NAME} returned invalid upload parameters")
+                url = _signed_url(signed)
+                headers = signed.get("headers")
+                if headers != {"Content-Type": content_type}:
+                    raise GeoDelError(f"{PRODUCT_NAME} returned invalid upload headers")
+                # ponytail: single-PUT attempts expire; immediate cleanup needs an API abort endpoint.
+                self._put_part(url, path, is_canceled, headers=headers, file_stat=file_stat,
+                               upload_progress=lambda uploaded: report(1, file_size, uploaded), require_etag=False)
+                report(1, file_size, file_size)
+                registered_id = self._register(attempt_id, organization_id, folder_id, is_canceled)
+            else:
+                initialized = self._request(
+                    "POST", "/uploads/s3/multipart", organization_id, is_canceled=is_canceled,
+                    json={"filename": filename, "type": content_type, "metadata": metadata},
+                )
+                attempt_id, key = initialized.get("uploadId"), initialized.get("key")
+                if not isinstance(attempt_id, str) or not attempt_id or not isinstance(key, str) or not key:
+                    raise GeoDelError(f"{PRODUCT_NAME} returned an invalid multipart response")
+                try:
+                    parts = self._upload_parts(path, file_stat, attempt_id, key, organization_id, report, is_canceled)
+                    validate_upload_file(path, file_stat)
+                    self._request(
+                        "POST", f"/uploads/s3/multipart/{attempt_id}/complete", organization_id,
+                        params={"key": key}, json={"parts": parts}, is_canceled=is_canceled,
+                    )
+                    registered_id = self._register(attempt_id, organization_id, folder_id, is_canceled)
+                except (GeoDelError, OSError) as error:
+                    try:
+                        self._request(
+                            "DELETE", f"/uploads/s3/multipart/{attempt_id}", organization_id,
+                            params={"key": key}, is_canceled=lambda: False,
+                        )
+                    except GeoDelError:
+                        pass
+                    if isinstance(error, GeoDelError):
+                        raise
+                    raise GeoDelError(f"Could not read upload file: {error}") from error
+        if progress:
+            progress(100)
         return registered_id
+
+    def _register(self, attempt_id, organization_id, folder_id, is_canceled):
+        if is_canceled and is_canceled():
+            raise UploadCanceled("Upload canceled")
+        registered = self._request(
+            "POST", "/uploads/register", organization_id, is_canceled=lambda: False,
+            json={"attemptId": attempt_id, **({"folderId": folder_id} if folder_id else {})},
+        )
+        registered_id = registered.get("id")
+        if not isinstance(registered_id, str) or not registered_id:
+            raise GeoDelError(f"{PRODUCT_NAME} returned an invalid upload response")
+        return registered_id
+
+    def _upload_parts(self, path, file_stat, attempt_id, key, organization_id, report, is_canceled):
+        file_size = file_stat.st_size
+        pending: Queue[int] = Queue()
+        for number in range(1, (file_size + PART_SIZE - 1) // PART_SIZE + 1):
+            pending.put(number)
+        stopped = Event()
+        parts = []
+        failures = []
+        result_lock = Lock()
+
+        def canceled():
+            return stopped.is_set() or bool(is_canceled and is_canceled())
+
+        def worker():
+            try:
+                with self.transport.session(), path.open("rb") as source:
+                    validate_upload_file(path, file_stat, source.fileno())
+                    while not canceled():
+                        try:
+                            number = pending.get_nowait()
+                        except Empty:
+                            return
+                        size = min(PART_SIZE, file_size - (number - 1) * PART_SIZE)
+                        source.seek((number - 1) * PART_SIZE)
+                        validate_upload_file(path, file_stat, source.fileno())
+                        chunk = source.read(size)
+                        validate_upload_file(path, file_stat, source.fileno())
+                        if len(chunk) != size:
+                            raise GeoDelError("Upload file changed during transfer")
+                        signed = self._request(
+                            "GET", f"/uploads/s3/multipart/{attempt_id}/{number}", organization_id,
+                            params={"key": key}, is_canceled=canceled, retry=True,
+                        )
+                        etag = self._put_part(
+                            _signed_url(signed), chunk, canceled,
+                            upload_progress=lambda uploaded: report(number, size, uploaded),
+                        )
+                        validate_upload_file(path, file_stat, source.fileno())
+                        report(number, size, size)
+                        with result_lock:
+                            parts.append({"PartNumber": number, "ETag": etag})
+                        del chunk
+            except (GeoDelError, OSError) as error:
+                with result_lock:
+                    if not stopped.is_set():
+                        failures.append(error)
+                        stopped.set()
+
+        with ThreadPoolExecutor(max_workers=PART_CONCURRENCY) as pool:
+            futures = [pool.submit(worker) for _ in range(min(PART_CONCURRENCY, pending.qsize()))]
+            for future in futures:
+                future.result()
+        if failures:
+            raise failures[0]
+        if canceled():
+            raise UploadCanceled("Upload canceled")
+        return sorted(parts, key=lambda part: part["PartNumber"])
 
     def publish_file(
         self,
@@ -339,12 +399,13 @@ class GeoDelClient:
             headers["X-Organization-Id"] = organization_id
 
         try:
-            response = self.transport.request(
+            response = self._send(
                 method,
                 f"{self.base_url}{path}",
                 headers=headers,
                 timeout=15,
                 is_canceled=kwargs.pop("is_canceled", None) or self.is_canceled,
+                retry=kwargs.pop("retry", False),
                 **{key: value for key, value in kwargs.items() if value is not None},
             )
         except TransportCanceled as error:
@@ -368,25 +429,81 @@ class GeoDelClient:
             raise GeoDelError(f"{PRODUCT_NAME} returned an invalid response")
         return payload
 
+    def _send(self, method, url, *, is_canceled=None, retry=False, **options):
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            if is_canceled and is_canceled():
+                raise TransportCanceled("Request canceled")
+            response = None
+            try:
+                response = self.transport.request(method, url, is_canceled=is_canceled, **options)
+            except (TransportConnectionError, TransportTimeout):
+                if not retry or attempt == len(RETRY_DELAYS):
+                    raise
+            else:
+                if not retry or not (response.status_code in (408, 429) or response.status_code >= 500):
+                    return response
+                if attempt == len(RETRY_DELAYS):
+                    return response
+            delay = RETRY_DELAYS[attempt] + randbelow(251) / 1000
+            if response:
+                delay = max(delay, _retry_after(response))
+            while delay > 0:
+                if is_canceled and is_canceled():
+                    raise TransportCanceled("Request canceled")
+                interval = min(0.05, delay)
+                sleep(interval)
+                delay -= interval
+        raise AssertionError("Retry budget exhausted without a result")
+
     def _put_part(
-        self, url: str, data: bytes,
-        is_canceled: Optional[Callable[[], bool]] = None,
+        self, url: str, data: Union[bytes, Path],
+        is_canceled: Optional[Callable[[], bool]] = None, *,
+        headers: Optional[Dict[str, str]] = None,
+        upload_progress: Optional[Callable[[int], None]] = None,
+        require_etag: bool = True,
+        file_stat=None,
     ) -> str:
         try:
-            response = self.transport.request(
-                "PUT", url, data=data, timeout=60,
-                is_canceled=is_canceled or self.is_canceled,
+            response = self._send(
+                "PUT", url, data=data, timeout=UPLOAD_PART_TIMEOUT_SECONDS,
+                is_canceled=is_canceled or self.is_canceled, retry=True,
+                **({"headers": headers} if headers else {}),
+                **({"upload_progress": upload_progress} if upload_progress else {}),
+                **({"file_stat": file_stat} if file_stat is not None else {}),
             )
         except TransportCanceled as error:
             raise UploadCanceled("Upload canceled") from error
         except TransportError as error:
             raise GeoDelError("Part upload failed: Network, TLS or timeout failure") from error
+        except OSError as error:
+            raise GeoDelError(f"Could not read upload file: {error}") from error
         if not 200 <= response.status_code < 300:
             raise GeoDelError(f"Part upload failed: HTTP {response.status_code}")
         etag = response.header("ETag")
-        if not etag:
+        if require_etag and not etag:
             raise GeoDelError("Storage returned no ETag for uploaded part")
-        return etag
+        return etag or ""
+
+
+def _signed_url(payload):
+    url = payload.get("url")
+    if not isinstance(url, str) or not url:
+        raise GeoDelError(f"{PRODUCT_NAME} returned an invalid part upload URL")
+    return url
+
+
+def _retry_after(response):
+    value = response.header("Retry-After")
+    if not value:
+        return 0
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            seconds = (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()
+        except (ValueError, TypeError, OverflowError):
+            return 0
+    return max(0, min(30, seconds))
 
 
 def _version_tuple(version: str) -> Tuple[int, int, int]:

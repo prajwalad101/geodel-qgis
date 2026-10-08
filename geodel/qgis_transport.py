@@ -1,25 +1,31 @@
 """Blocking native QGIS HTTP, called only from plugin background tasks.
 
-Each call owns a fresh QGIS network manager and follows redirects explicitly.
+Upload sessions reuse thread-owned, isolated network managers and follow redirects explicitly.
 Reload-safe process-lifetime hooks, installed on the GUI thread,
 restore policy only inside this thread's request scope. They retain no keys
 between calls and leave every other QGIS request untouched. Registering and
 removing QGIS's global preprocessor list from concurrent workers is unsafe.
 """
 from dataclasses import dataclass
+from contextlib import contextmanager
 import json as json_codec
+import os
+from pathlib import Path
 from threading import local
 from time import monotonic
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
 from urllib.parse import urlencode
 
 from qgis.PyQt.QtCore import (
-    QByteArray, QCoreApplication, QEvent, QEventLoop, QObject, Qt, QThread, QTimer, QUrl, pyqtSignal,
+    QByteArray, QCoreApplication, QEvent, QEventLoop, QFile, QIODevice, QObject, Qt, QThread, QTimer, QUrl,
+    pyqtSignal,
 )
 from qgis.PyQt.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest, QSslError
 from qgis.core import QgsApplication, QgsNetworkAccessManager
 
-from .transport import Response, TransportCanceled, TransportError, TransportTimeout
+from .transport import (
+    Response, TransportCanceled, TransportConnectionError, TransportError, TransportTimeout, validate_upload_file,
+)
 
 
 _CREDENTIAL_HEADERS = ("Authorization", "X-Organization-Id", "X-Plugin-Version")
@@ -132,15 +138,62 @@ class _RequestCancellation(QObject):
     requested = pyqtSignal()
 
 
+class _BoundedFile(QFile):
+    def __init__(self, path, expected):
+        super().__init__(str(path))
+        self.path = path
+        self.expected = expected
+        self.changed = False
+
+    def validate(self):
+        if self.changed:
+            raise OSError("Upload file changed during transfer")
+        validate_upload_file(self.path, self.expected, int(self.handle()))
+
+    def size(self):
+        return self.expected.st_size
+
+    def readData(self, maximum):
+        # Qt calls this virtual method; report errors after the reply, not across C++.
+        try:
+            self.validate()
+            data = super().readData(min(maximum, max(0, self.size() - self.pos())))
+            self.validate()
+            return data
+        except OSError:
+            self.changed = True
+            return b""
+
+
 class QgisTransport:
+    def __init__(self):
+        self._sessions = local()
+
+    @contextmanager
+    def session(self):
+        previous = getattr(self._sessions, "managers", None)
+        if previous is not None:
+            yield
+            return
+        self._sessions.managers = {}
+        try:
+            yield
+        finally:
+            for manager in self._sessions.managers.values():
+                manager.deleteLater()
+                QCoreApplication.sendPostedEvents(manager, QEvent.Type.DeferredDelete)
+            del self._sessions.managers
+
     def request(
         self, method: str, url: str, *,
         headers: Optional[Mapping[str, str]] = None,
         params: Optional[Dict[str, Any]] = None,
         json: Optional[Dict[str, Any]] = None,
-        data: Optional[bytes] = None,
+        data: Optional[Union[bytes, Path]] = None,
+        file_stat: Optional[os.stat_result] = None,
         timeout: float = 15,
         is_canceled: Optional[Callable[[], bool]] = None,
+        upload_progress: Optional[Callable[[int], None]] = None,
     ) -> Response:
         if QThread.currentThread() == QgsApplication.instance().thread():
             raise TransportError("Network requests require a background task")
@@ -160,15 +213,22 @@ class QgisTransport:
             any(name.lower() in {header.lower() for header in _CREDENTIAL_HEADERS}
                 for name in request_headers),
         )
-        # Construction retains QGIS's proxy factory (which resolves through the
-        # current thread's configured manager) and TLS request preparation, but
-        # gives this call its own authentication/connection cache. Do not call
+        # Initialize the event dispatcher before QGIS constructs its timers in
+        # Python pool threads. The request's nested loop drives cancellation.
+        loop = QEventLoop()
+        # Construction retains QGIS's proxy factory and TLS preparation, but
+        # isolates authentication/connection caches by origin and credentials. Do not call
         # setupDefaultProxyAndCache: that wires up shared cookies and auth dialogs.
-        manager = QgsNetworkAccessManager()
+        managers = getattr(self._sessions, "managers", None)
+        manager_key = (policy.origin, tuple(sorted(policy.headers.items())) if policy.authenticated else ())
+        manager = managers.get(manager_key) if managers is not None else None
+        if manager is None:
+            manager = QgsNetworkAccessManager()
+            if managers is not None:
+                managers[manager_key] = manager
         timer = QTimer()
         cancellation = _RequestCancellation(manager)
         abort_connection = None
-        loop = None
         result = None
         reply_pending = False
         deadline = monotonic() + timeout
@@ -179,7 +239,13 @@ class QgisTransport:
             nonlocal expired, canceled
             canceled = bool(is_canceled and is_canceled())
             expired = monotonic() >= deadline
-            if (canceled or expired) and reply_pending:
+            changed = False
+            if source is not None and file_stat is not None:
+                try:
+                    source.validate()
+                except OSError:
+                    source.changed = changed = True
+            if (canceled or expired or changed) and reply_pending:
                 cancellation.requested.emit()
 
         def manager_timeout(_reply):
@@ -208,6 +274,11 @@ class QgisTransport:
             if abort_connection is not None:
                 QObject.disconnect(abort_connection)
             loop.quit()
+            completed_reply.deleteLater()
+
+        def transferred(sent, _total):
+            if upload_progress:
+                upload_progress(int(sent))
 
         # These callbacks access worker-owned Qt objects. Do not queue them
         # past completion or destruction of the request's manager and reply.
@@ -220,7 +291,14 @@ class QgisTransport:
         timer.timeout.connect(check_request, Qt.ConnectionType.DirectConnection)
         _request_scope.policy = policy
         timer.start()
+        source = None
         try:
+            if isinstance(data, Path):
+                source = _BoundedFile(data, file_stat) if file_stat is not None else QFile(str(data))
+                if not source.open(QIODevice.OpenModeFlag.ReadOnly):
+                    raise OSError("Could not open upload file")
+                if file_stat is not None:
+                    source.validate()
             next_url = request_url
             while True:
                 check_request()
@@ -233,19 +311,31 @@ class QgisTransport:
                 abort_connection = None
                 reply_pending = True
                 request = QNetworkRequest(next_url)
+                if source is not None:
+                    if file_stat is not None:
+                        source.validate()
+                    if not source.seek(0):
+                        raise OSError("Could not rewind upload file")
+                    body = source
+                else:
+                    body = QByteArray(data or b"")
                 if method == "GET":
                     reply = manager.get(request)
                 elif method == "POST":
-                    reply = manager.post(request, QByteArray(data or b""))
+                    reply = manager.post(request, body)
                 elif method == "PUT":
-                    reply = manager.put(request, QByteArray(data or b""))
+                    reply = manager.put(request, body)
                 else:
                     reply = manager.deleteResource(request)
                 if result is None:
+                    if upload_progress:
+                        reply.uploadProgress.connect(transferred, Qt.ConnectionType.DirectConnection)
                     # A native Qt connection stops targeting a deleted reply
                     # automatically; a Python callback calling abort() does not.
                     abort_connection = cancellation.requested.connect(reply.abort, Qt.ConnectionType.DirectConnection)
                     loop.exec()
+                if source is not None and file_stat is not None:
+                    source.validate()
                 if canceled or (is_canceled and is_canceled()):
                     raise TransportCanceled("Request canceled")
                 if expired or monotonic() >= deadline:
@@ -261,6 +351,15 @@ class QgisTransport:
                 if not response.status_code or (
                     error != QNetworkReply.NetworkError.NoError and response.status_code < 400
                 ):
+                    if error in (
+                        QNetworkReply.NetworkError.ConnectionRefusedError,
+                        QNetworkReply.NetworkError.RemoteHostClosedError,
+                        QNetworkReply.NetworkError.HostNotFoundError,
+                        QNetworkReply.NetworkError.TemporaryNetworkFailureError,
+                        QNetworkReply.NetworkError.NetworkSessionFailedError,
+                        QNetworkReply.NetworkError.UnknownNetworkError,
+                    ):
+                        raise TransportConnectionError("Connection failed")
                     raise TransportError("Network or TLS failure")
                 if redirect is not None and 300 <= response.status_code < 400:
                     next_url = policy.url.resolved(redirect)
@@ -269,9 +368,16 @@ class QgisTransport:
         finally:
             timer.stop()
             timer.timeout.disconnect(check_request)
-            del _request_scope.policy
             if reply_pending:
                 cancellation.requested.emit()
-            # Destroy in the worker thread, including replies and cached credentials.
-            manager.deleteLater()
-            QCoreApplication.sendPostedEvents(manager, QEvent.Type.DeferredDelete)
+            del _request_scope.policy
+            manager_finished.disconnect(finished)
+            manager.requestTimedOut[QNetworkReply].disconnect(manager_timeout)
+            cancellation.deleteLater()
+            if source is not None:
+                source.close()
+            # Dispose replies before reuse; cached connections last only for this session.
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            if managers is None:
+                manager.deleteLater()
+                QCoreApplication.sendPostedEvents(manager, QEvent.Type.DeferredDelete)

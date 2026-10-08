@@ -5,6 +5,7 @@ import sys
 import time
 from threading import Thread
 import unittest
+from unittest.mock import patch
 
 from qgis.PyQt.QtWidgets import QApplication
 from qgis.core import QgsApplication, QgsTask
@@ -15,6 +16,8 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        if hasattr(self.server, "connections"):
+            self.server.connections.append(self.client_address)
         self.server.received.append((self.command, self.path, {name.lower(): value for name, value in self.headers.items()},
                                      self.rfile.read(int(self.headers.get("Content-Length", 0)))))
         if getattr(self.server, "proxy_auth", False) and not self.headers.get("Proxy-Authorization"):
@@ -99,6 +102,227 @@ class NetworkRuntimeTests(unittest.TestCase):
         method, path, headers, _body = self.server.received[0]
         self.assertEqual((method, path), ("GET", "/api/v1/organizations"))
         self.assertEqual(headers["authorization"], "Bearer synthetic-key")
+
+    def test_upload_session_reuses_connections_without_api_credentials_on_storage(self):
+        from geodel.qgis_transport import QgisTransport
+        self.server.RequestHandlerClass = type("KeepAliveHandler", (Handler,), {"protocol_version": "HTTP/1.1"})
+        self.server.connections = []
+
+        def operation(_task):
+            transport = QgisTransport()
+            with transport.session():
+                for _ in range(2):
+                    transport.request("GET", self.url + "/api", headers={"Authorization": "Bearer synthetic"})
+                    transport.request("PUT", self.url + "/storage", data=b"bytes")
+            self.assertFalse(hasattr(transport._sessions, "managers"))
+
+        self.in_task(operation)
+        connections = self.server.connections
+        self.assertEqual(connections[0], connections[2])
+        self.assertEqual(connections[1], connections[3])
+        self.assertNotEqual(connections[0], connections[1])
+        for row in self.server.received[1::2]:
+            self.assertNotIn("authorization", row[2])
+
+    def test_single_put_streams_file_rewinds_redirect_and_registers_last(self):
+        import os
+        from pathlib import Path
+        from geodel.client import GeoDelClient
+        from geodel.qgis_transport import QgisTransport
+
+        source = Path(os.environ["GEODEL_RUNTIME_ROOT"]) / "single.geojson"
+        original = b"synthetic bytes" * 10000
+        source.write_bytes(original)
+        self.server.redirect_url = "/storage"
+        def route(method, path):
+            if path.startswith("/api/v1/uploads/s3/params"):
+                return 200, json.dumps({
+                    "attemptId": "single", "method": "PUT", "url": self.url + "/redirect",
+                    "headers": {"Content-Type": "application/geo+json"},
+                }).encode()
+            if path.endswith("/register"):
+                return 200, b'{"id":"registered"}'
+            return 200, b'{}'
+        self.server.route = route
+        progress = []
+        result = self.in_task(lambda task: GeoDelClient(
+            self.url, "synthetic-key", "0.1.0", QgisTransport(), task.isCanceled,
+        ).upload_file(source, source.name, "org", progress=progress.append))
+        self.assertEqual(result, "registered")
+        puts = [row for row in self.server.received if row[0] == "PUT"]
+        self.assertEqual([row[3] for row in puts], [original, original])
+        for row in puts:
+            self.assertEqual(row[2]["content-type"], "application/geo+json")
+            self.assertNotIn("authorization", row[2])
+        self.assertTrue(self.server.received[-1][1].endswith("/register"))
+        self.assertEqual(progress, sorted(progress))
+        self.assertEqual(progress[-1], 100)
+
+    def test_native_parts_overlap_and_complete_in_order(self):
+        import os
+        from pathlib import Path
+        from threading import Barrier
+        from geodel.client import GeoDelClient
+        from geodel.qgis_transport import QgisTransport
+
+        source = Path(os.environ["GEODEL_RUNTIME_ROOT"]) / "parallel.geojson"
+        original = bytes(range(47))
+        source.write_bytes(original)
+        barrier = Barrier(3)
+        def route(method, path):
+            if method == "PUT":
+                barrier.wait(timeout=2)
+            if path == "/api/v1/uploads/s3/multipart":
+                return 200, b'{"uploadId":"attempt","key":"key"}'
+            if method == "GET":
+                number = path.split("?")[0].rsplit("/", 1)[1]
+                return 200, json.dumps({"url": self.url + "/part/" + number}).encode()
+            return 200, b'{"id":"registered"}'
+        self.server.route = route
+        with patch("geodel.client.SINGLE_PUT_THRESHOLD", 0), patch("geodel.client.PART_SIZE", 8):
+            result = self.in_task(lambda task: GeoDelClient(
+                self.url, "synthetic-key", "0.1.0", QgisTransport(), task.isCanceled,
+            ).upload_file(source, source.name, "org"))
+        self.assertEqual(result, "registered")
+        puts = sorted((row for row in self.server.received if row[0] == "PUT"), key=lambda row: row[1])
+        self.assertEqual(b"".join(row[3] for row in puts), original)
+        for row in puts:
+            self.assertNotIn("authorization", row[2])
+        complete = next(row for row in self.server.received if "/complete" in row[1])
+        self.assertEqual([part["PartNumber"] for part in json.loads(complete[3])["parts"]], list(range(1, 7)))
+
+    def test_python_pool_workers_enforce_deadline_and_cancel(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from geodel.qgis_transport import QgisTransport
+        from geodel.transport import TransportCanceled, TransportTimeout
+
+        def operation(_task):
+            transport = QgisTransport()
+            def worker(expected):
+                started = time.monotonic()
+                options = {"timeout": 0.05} if expected is TransportTimeout else {
+                    "is_canceled": lambda: time.monotonic() - started > 0.05,
+                }
+                with transport.session(), self.assertRaises(expected):
+                    transport.request("PUT", self.url + "/slow", data=b"bytes", **options)
+                self.assertLess(time.monotonic() - started, 0.3)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(worker, expected) for expected in (TransportTimeout, TransportCanceled)]
+                for future in futures:
+                    future.result()
+        self.in_task(operation)
+
+    def test_missing_streamed_file_reports_read_error_and_does_not_register(self):
+        import os
+        from pathlib import Path
+        from geodel.client import GeoDelClient, GeoDelError
+        from geodel.qgis_transport import QgisTransport
+
+        source = Path(os.environ["GEODEL_RUNTIME_ROOT"]) / "missing.geojson"
+        source.write_bytes(b"bytes")
+        def route(_method, _path):
+            source.unlink()
+            return 200, json.dumps({
+                "attemptId": "single", "method": "PUT", "url": self.url + "/storage",
+                "headers": {"Content-Type": "application/geo+json"},
+            }).encode()
+        self.server.route = route
+        with self.assertRaisesRegex(GeoDelError, "Could not read upload file"):
+            self.in_task(lambda task: GeoDelClient(
+                self.url, "synthetic-key", "0.1.0", QgisTransport(), task.isCanceled,
+            ).upload_file(source, source.name, "org"))
+        self.assertEqual(len(self.server.received), 1)
+
+    def test_mutable_single_put_source_never_registers(self):
+        import os
+        from pathlib import Path
+        from geodel.client import GeoDelClient, GeoDelError
+        from geodel.qgis_transport import QgisTransport
+
+        source = Path(os.environ["GEODEL_RUNTIME_ROOT"]) / "mutable.geojson"
+        original = b"synthetic data"
+        for mutation in ("grow", "shrink", "replace", "after_put", "retry"):
+            with self.subTest(mutation=mutation):
+                source.write_bytes(original)
+                self.server.received.clear()
+
+                def route(method, path):
+                    if path.split("?", 1)[0].endswith("/params"):
+                        if mutation == "grow":
+                            with source.open("ab") as stream:
+                                stream.write(b"extra")
+                        elif mutation == "shrink":
+                            source.write_bytes(b"short")
+                        elif mutation == "replace":
+                            replacement = source.with_suffix(".replacement")
+                            replacement.write_bytes(original)
+                            replacement.replace(source)
+                        return 200, json.dumps({
+                            "attemptId": "single", "method": "PUT", "url": self.url + "/storage",
+                            "headers": {"Content-Type": "application/geo+json"},
+                        }).encode()
+                    if method == "PUT":
+                        source.write_bytes(original + b"extra")
+                        return (503 if mutation == "retry" else 200), b""
+                    self.fail("Changed upload must not register")
+
+                self.server.route = route
+                with self.assertRaisesRegex(GeoDelError, "Upload file changed"):
+                    self.in_task(lambda task: GeoDelClient(
+                        self.url, "synthetic-key", "0.1.0", QgisTransport(), task.isCanceled,
+                    ).upload_file(source, source.name, "org"))
+                puts = [body for method, _path, _headers, body in self.server.received if method == "PUT"]
+                self.assertEqual(puts, [original] if mutation in ("after_put", "retry") else [])
+
+    def test_cancel_after_registration_starts_returns_committed_upload(self):
+        import os
+        from pathlib import Path
+        from geodel.client import GeoDelClient
+        from geodel.qgis_transport import QgisTransport
+
+        source = Path(os.environ["GEODEL_RUNTIME_ROOT"]) / "registration.geojson"
+        source.write_bytes(b"synthetic")
+
+        def route(method, path):
+            if path.split("?", 1)[0].endswith("/params"):
+                return 200, json.dumps({
+                    "attemptId": "single", "method": "PUT", "url": self.url + "/storage",
+                    "headers": {"Content-Type": "application/geo+json"},
+                }).encode()
+            if path.endswith("/register"):
+                self.server.started.set()
+                time.sleep(0.05)
+                return 200, b'{"id":"registered"}'
+            self.assertEqual(method, "PUT")
+            return 200, b""
+
+        self.server.route = route
+        result = self.in_task(lambda _task: GeoDelClient(
+            self.url, "synthetic-key", "0.1.0", QgisTransport(), self.server.started.is_set,
+        ).upload_file(source, source.name, "org"))
+        self.assertTrue(self.server.started.is_set())
+        self.assertEqual(result, "registered")
+
+    def test_bounded_device_stops_reading_a_growing_file(self):
+        import os
+        from pathlib import Path
+        from geodel.qgis_transport import _BoundedFile
+        from qgis.PyQt.QtCore import QIODevice
+
+        source = Path(os.environ["GEODEL_RUNTIME_ROOT"]) / "growing.geojson"
+        source.write_bytes(b"x" * 65536)
+        device = _BoundedFile(source, source.stat())
+        self.assertTrue(device.open(QIODevice.OpenModeFlag.ReadOnly | QIODevice.OpenModeFlag.Unbuffered))
+        try:
+            self.assertEqual(bytes(device.read(16)), b"x" * 16)
+            with source.open("ab") as stream:
+                stream.write(b"extra")
+            self.assertEqual(device.size(), 65536)
+            self.assertEqual(bytes(device.readAll()), b"")
+            with self.assertRaisesRegex(OSError, "Upload file changed"):
+                device.validate()
+        finally:
+            device.close()
 
     def test_same_origin_redirect_restores_auth_and_tenancy(self):
         from geodel.qgis_transport import QgisTransport
@@ -219,7 +443,7 @@ class NetworkRuntimeTests(unittest.TestCase):
                 self.assertEqual(transport.QgisTransport().request("GET", self.url).status_code, 503)
             self.in_task(operation)
 
-    def test_cancel_active_task_aborts_reply_and_stops_timer(self):
+    def test_cancel_upload_part_with_five_minute_deadline_aborts_reply_and_cleans_up(self):
         from geodel.qgis_transport import QgisTransport
         from geodel.transport import TransportCanceled
         from qgis.PyQt.QtCore import QTimer
@@ -227,7 +451,8 @@ class NetworkRuntimeTests(unittest.TestCase):
         def operation(task):
             tasks.append(task)
             with self.assertRaises(TransportCanceled):
-                QgisTransport().request("GET", self.url + "/slow", is_canceled=task.isCanceled)
+                QgisTransport().request("PUT", self.url + "/slow", data=b"bytes",
+                                        timeout=300, is_canceled=task.isCanceled)
             # Ignore original cancellation for a bounded cleanup request.
             return QgisTransport().request("DELETE", self.url + "/cleanup", timeout=0.2)
         timer = QTimer()
@@ -420,7 +645,8 @@ class NetworkRuntimeTests(unittest.TestCase):
             def operation(task):
                 tasks.append(task)
                 client = GeoDelClient(self.url, "synthetic-key", "0.1.0", QgisTransport(), task.isCanceled)
-                with self.assertRaises(expected):
+                with patch("geodel.client.SINGLE_PUT_THRESHOLD", 0), \
+                        patch("geodel.client.RETRY_DELAYS", (0, 0, 0)), self.assertRaises(expected):
                     client.upload_file(source, source.name, "org-1")
             timer = QTimer()
             timer.setInterval(10)

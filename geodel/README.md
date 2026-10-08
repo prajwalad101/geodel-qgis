@@ -28,8 +28,18 @@ Shapefile field-name/type limitations apply to multi-layer exports.
 Use **Browse…** to upload an existing `.geojson`, `.json`, or `.zip` unchanged
 (the ZIP should contain supported vector data such as Shapefiles). File
 extensions alone do not guarantee valid data; GeoDel validates/processes the
-contents. Maximum upload size is **60 MiB (62,914,560 bytes)**, shown as 60 MB
+contents. Maximum upload size is **200 MiB (209,715,200 bytes)**, shown as 200 MB
 in the panel. Limit applies to the final file, including project exports.
+Choose **Cancel upload** during layer preparation or transfer to stop the task.
+Wait for cancellation to finish before retrying; the selected source and name
+are retained. A file already registered with GeoDel remains in Recent uploads.
+Files up to 100 MiB use one streamed PUT; larger files upload three 10 MiB
+parts concurrently. Part-signing requests and storage PUTs retry temporary
+network/server failures up to three times with a short delay. Initialization,
+completion and registration requests do not retry. Each transfer attempt can
+take up to five minutes; QGIS network inactivity settings also apply. Progress
+reaches 100% after registration. Once registration starts, cancellation waits
+for its result (up to 15 seconds); a successful registration remains uploaded.
 Names cannot contain `/`.
 
 Upload runs in QGIS Task Manager. Recent uploads refresh while the panel is
@@ -56,8 +66,10 @@ opening setup/details links launches your browser. Sharing links can grant
 access to uploaded data; handle them according to your data policy.
 
 Networking honors QGIS proxy and TLS settings. API calls have a 15-second
-deadline; signed-storage requests have a 60-second deadline. Cancel from QGIS
+deadline; signed-storage requests have a five-minute deadline per attempt. Cancel from QGIS
 Task Manager; canceled/failed multipart transfers attempt server cleanup.
+Canceled/failed single-PUT attempts rely on server expiration and cleanup;
+their temporary storage reservation may remain until then.
 GeoDel retains uploaded files according to service/account settings; manage
 or delete files in the web app. See GeoDel's current service terms/privacy
 information before uploading sensitive data.

@@ -34,6 +34,9 @@ class Task:
     def addSubTask(self, task, _dependencies, _mode):
         self.subtasks.append(task)
 
+    def setDependentLayers(self, layers):
+        self.layers = layers
+
     def isCanceled(self):
         return False
 
@@ -136,13 +139,13 @@ from geodel.layer_export import LayerExport
 
 def test_prepares_zipped_shapefiles_with_safe_unique_names_and_owned_cleanup():
     completed = []
-    task = LayerExport([Layer("Roads"), Layer("roads"), Layer("con.txt")]).create_task(
-        lambda error, artifact: completed.append((error, artifact))
-    )
+    export = LayerExport([Layer("Roads"), Layer("roads"), Layer("con.txt")])
+    while export.has_more_layers:
+        task = export.create_task(lambda error, artifact: completed.append((error, artifact)))
+        assert len(task.subtasks) == 1
+        task.run()
 
-    task.run()
-
-    error, artifact = completed[0]
+    error, artifact = completed[-1]
     assert error is None
     assert artifact.suffix == ".zip"
     with ZipFile(artifact.path) as archive:

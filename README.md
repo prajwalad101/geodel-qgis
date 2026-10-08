@@ -38,8 +38,14 @@ acceptance and manual platform verification are pending; use ZIP installation.
 
 One project layer exports as **GeoJSON**; multiple layers export as **zipped
 Shapefiles**, using EPSG:4326. Browse uploads `.geojson`, `.json`, or `.zip`
-files unchanged. Limits are **20 project layers** and **60 MiB per upload**
-(shown as 60 MB in the panel). Raster and empty layers are unsupported.
+files unchanged. Limits are **20 project layers** and **200 MiB per upload**
+(shown as 200 MB in the panel). Raster and empty layers are unsupported.
+Files up to 100 MiB use a single streamed transfer; larger files upload three
+10 MiB parts concurrently. Temporary transfer failures retry automatically.
+
+Choose **Cancel upload** to stop layer preparation or a file transfer. Wait for
+cancellation to finish before retrying. Already registered files remain in
+Recent uploads.
 
 Try the [licensed synthetic sample](geodel/sample/README.md) for your first upload.
 

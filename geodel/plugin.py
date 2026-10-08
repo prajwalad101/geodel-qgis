@@ -52,6 +52,7 @@ class GeoDelPlugin:
         self._organization_version = 0
         self._folder_task = None
         self._upload_task = None
+        self._upload_cancel_requested = False
         self._uploads_task = None
         self._version_task = None
         self._recent_timer = None
@@ -95,6 +96,7 @@ class GeoDelPlugin:
         )
         self._connect(self.dock.upload_name.textChanged, self._update_upload_enabled)
         self._connect(self.dock.upload_button.clicked, self._start_upload)
+        self._connect(self.dock.cancel_upload_button.clicked, self._cancel_upload)
         self._connect(self.dock.visibilityChanged, self._panel_visibility_changed, with_arguments=True)
         self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock)
         self.dock.hide()
@@ -709,6 +711,7 @@ class GeoDelPlugin:
             return
         self._disconnect_upload_progress()
         self._upload_task = task
+        self._upload_cancel_requested = False
         self.dock.set_uploading(True)
         if exporting:
             self.dock.upload_button.setText("Preparing layers…")
@@ -721,6 +724,18 @@ class GeoDelPlugin:
         task.progressChanged.connect(show_progress)
         self._upload_progress = (task.progressChanged, show_progress)
         QgsApplication.taskManager().addTask(task)
+
+    def _cancel_upload(self):
+        if (
+            self.dock is None or self._upload_task is None
+            or self._upload_cancel_requested
+        ):
+            return
+        self._upload_cancel_requested = True
+        self.dock.cancel_upload_button.setEnabled(False)
+        self.dock.cancel_upload_button.setText("Canceling…")
+        self.dock.status.setText("Canceling upload…")
+        cancel_task(self._upload_task)
 
     def _start_upload(self):
         if self._upload_task is not None:
@@ -775,20 +790,32 @@ class GeoDelPlugin:
         if destination is None:
             return
 
-        version = self._connection_version
+        self._run_upload_task(
+            self._new_layer_export_task(export, self._connection_version, upload_filename, destination),
+            exporting=True,
+        )
+
+    def _new_layer_export_task(self, export, version, upload_filename, destination):
         task: QgsTask = export.create_task(
             lambda error, artifact: self._layer_export_finished(
-                task, version, upload_filename, destination, error, artifact
+                task, version, upload_filename, destination, error, artifact, export
             )
         )
-        self._run_upload_task(task, exporting=True)
+        return task
 
     def _layer_export_finished(
-        self, task, version, upload_filename, destination, error, artifact
+        self, task, version, upload_filename, destination, error, artifact, export=None
     ):
         if task is not self._upload_task:
             if artifact:
                 artifact.cleanup()
+            return
+        if self._upload_cancel_requested:
+            if artifact:
+                artifact.cleanup()
+            self._upload_finished(
+                task, version, destination["server_url"], None, None
+            )
             return
         if error is not None:
             self._upload_finished(
@@ -798,6 +825,12 @@ class GeoDelPlugin:
         if artifact is None:
             self._upload_finished(
                 task, version, destination["server_url"], None, None
+            )
+            return
+        if export is not None and export.has_more_layers:
+            self._run_upload_task(
+                self._new_layer_export_task(export, version, upload_filename, destination),
+                exporting=True,
             )
             return
         self._run_upload_task(
@@ -810,7 +843,10 @@ class GeoDelPlugin:
         if task is not self._upload_task:
             return
         self._disconnect_upload_progress()
+        if self._upload_cancel_requested and result is None:
+            error = None
         self._upload_task = None
+        self._upload_cancel_requested = False
         if self.dock is None:
             return
         self.dock.set_uploading(False)
