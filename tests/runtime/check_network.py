@@ -5,6 +5,8 @@ import sys
 import time
 from threading import Thread
 import unittest
+from dataclasses import replace
+from geodel.config import DEFAULT_CONFIG
 from unittest.mock import patch
 
 from qgis.PyQt.QtWidgets import QApplication
@@ -179,7 +181,7 @@ class NetworkRuntimeTests(unittest.TestCase):
                 return 200, json.dumps({"url": self.url + "/part/" + number}).encode()
             return 200, b'{"id":"registered"}'
         self.server.route = route
-        with patch("geodel.client.SINGLE_PUT_THRESHOLD", 0), patch("geodel.client.PART_SIZE", 8):
+        with patch("geodel.client.DEFAULT_CONFIG", replace(DEFAULT_CONFIG, single_put_threshold_bytes=0, part_size_bytes=8)):
             result = self.in_task(lambda task: GeoDelClient(
                 self.url, "synthetic-key", "0.1.0", QgisTransport(), task.isCanceled,
             ).upload_file(source, source.name, "org"))
@@ -645,8 +647,8 @@ class NetworkRuntimeTests(unittest.TestCase):
             def operation(task):
                 tasks.append(task)
                 client = GeoDelClient(self.url, "synthetic-key", "0.1.0", QgisTransport(), task.isCanceled)
-                with patch("geodel.client.SINGLE_PUT_THRESHOLD", 0), \
-                        patch("geodel.client.RETRY_DELAYS", (0, 0, 0)), self.assertRaises(expected):
+                client.config = replace(DEFAULT_CONFIG, single_put_threshold_bytes=0, retry_delays_seconds=(0, 0, 0))
+                with self.assertRaises(expected):
                     client.upload_file(source, source.name, "org-1")
             timer = QTimer()
             timer.setInterval(10)

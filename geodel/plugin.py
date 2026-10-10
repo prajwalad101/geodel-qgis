@@ -13,22 +13,21 @@ from qgis.core import (
 )
 
 from .client import (
-    MAX_FILE_SIZE, MAX_FILE_SIZE_LABEL, AuthenticationError, GeoDelError,
+    AuthenticationError, GeoDelError,
     ServerUnavailableError,
 )
 from .auth_compat import unpack_auth_result
-from .config import API_URL, PRODUCT_NAME
+from .config import API_URL, DEFAULT_CONFIG, PRODUCT_NAME
 from .dock import GeoDelDockWidget
 from .layer_export import LayerExport
 from .task_lifecycle import cancel_task, disconnect_signal, task_is_active
 from .tasks import (
-    _load_organizations, _requires_update, _load_folders, _load_recent_uploads,
+    _load_organizations, _load_metadata, _load_folders, _load_recent_uploads,
     _upload_file,
 )
 
 SETTINGS_PREFIX = "GeoDel"
-RECENT_REFRESH_MILLISECONDS = 5_000
-CONNECTION_TIMEOUT_MILLISECONDS = 5_000
+METADATA_REFRESH_MILLISECONDS = 5 * 60 * 1000
 SERVER_UNAVAILABLE_MESSAGE = (
     "Couldn't connect to server. If this keeps happening please contact support."
 )
@@ -55,6 +54,8 @@ class GeoDelPlugin:
         self._upload_cancel_requested = False
         self._uploads_task = None
         self._version_task = None
+        self._metadata_timer = None
+        self._config = DEFAULT_CONFIG
         self._recent_timer = None
         self._selected_path = None
         self._candidate_api_key = None
@@ -78,7 +79,7 @@ class GeoDelPlugin:
         self.iface.addWebToolBarIcon(self.action)
 
         self.dock = GeoDelDockWidget(self.iface.mainWindow())
-        self._connect(self.dock.refresh_requested, self._refresh_organizations)
+        self._connect(self.dock.refresh_requested, self._refresh_connection)
         self._connect(self.dock.connect_requested, self._save_and_connect)
         self._connect(self.dock.manage_requested, self._manage_connection)
         self._connect(self.dock.return_requested, self._return_to_main)
@@ -101,12 +102,16 @@ class GeoDelPlugin:
         self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock)
         self.dock.hide()
         self._recent_timer = QTimer(self.dock)
-        self._recent_timer.setInterval(RECENT_REFRESH_MILLISECONDS)
+        self._recent_timer.setInterval(self._config.recent_uploads_refresh_seconds * 1000)
         self._connect(self._recent_timer.timeout, self._refresh_recent_uploads)
         self._organization_timer = QTimer(self.dock)
         self._organization_timer.setSingleShot(True)
-        self._organization_timer.setInterval(CONNECTION_TIMEOUT_MILLISECONDS)
+        self._organization_timer.setInterval(self._config.connection_feedback_timeout_seconds * 1000)
         self._connect(self._organization_timer.timeout, self._organization_timed_out)
+        self._metadata_timer = QTimer(self.dock)
+        self._metadata_timer.setInterval(METADATA_REFRESH_MILLISECONDS)
+        self._connect(self._metadata_timer.timeout, self._check_version)
+        self.dock.browse_button.set_config(self._config)
         project = QgsProject.instance()
         self._connect(project.layersAdded, self._refresh_layers)
         self._connect(project.layersRemoved, self._refresh_layers)
@@ -132,7 +137,7 @@ class GeoDelPlugin:
             disconnect_signal(signal, callback)
         self._signals.clear()
         self._disconnect_upload_progress()
-        for name in ("_recent_timer", "_organization_timer"):
+        for name in ("_recent_timer", "_organization_timer", "_metadata_timer"):
             timer = getattr(self, name)
             if timer is not None:
                 timer.stop()
@@ -170,41 +175,73 @@ class GeoDelPlugin:
         if self.action:
             self.action.setChecked(visible)
         if visible:
+            self._check_version()
             self._refresh_layers()
             self._refresh_organizations()
             if self._recent_timer:
                 self._recent_timer.start()
+            if self._metadata_timer:
+                self._metadata_timer.start()
         else:
             if self._recent_timer:
                 self._recent_timer.stop()
+            if self._metadata_timer:
+                self._metadata_timer.stop()
             cancel_task(self._uploads_task)
             self._uploads_task = None
 
     def _check_version(self):
-        cancel_task(self._version_task)
+        if self.dock is None or self._version_task is not None:
+            return
         task: QgsTask = QgsTask.fromFunction(
-            f"Check {PRODUCT_NAME} plugin version",
-            _requires_update,
+            f"Load {PRODUCT_NAME} plugin metadata",
+            _load_metadata,
             on_finished=lambda error, result=None: self._version_checked(
                 task, error, result
             ),
             server_url=API_URL,
+            config=self._config,
         )
         self._version_task = task
         QgsApplication.taskManager().addTask(task)
 
-    def _version_checked(self, task, error, requires_update):
+    def _version_checked(self, task, error, metadata):
         if task is not self._version_task:
             return
         self._version_task = None
-        if self.dock is None or error is not None or requires_update is None:
+        if self.dock is None:
             return
+        if error is not None:
+            QgsMessageLog.logMessage(
+                "Could not load plugin metadata; retaining current settings.",
+                PRODUCT_NAME, Qgis.MessageLevel.Warning,
+            )
+            return
+        if metadata is None:
+            return
+        requires_update, config, config_error = metadata
+        if config_error:
+            QgsMessageLog.logMessage(
+                "Invalid plugin configuration; retaining current settings.",
+                PRODUCT_NAME, Qgis.MessageLevel.Warning,
+            )
+        if config is not None:
+            self._config = config
+            self.dock.browse_button.set_config(config)
+            self._recent_timer.setInterval(config.recent_uploads_refresh_seconds * 1000)
+            self._organization_timer.setInterval(config.connection_feedback_timeout_seconds * 1000)
+            self._update_upload_enabled()
+        was_visible = not self.dock.update_notice.isHidden()
         self.dock.update_notice.setVisible(requires_update)
-        if requires_update:
+        if requires_update and not was_visible:
             self.iface.messageBar().pushWarning(
                 PRODUCT_NAME,
                 f"Please update the {PRODUCT_NAME} plugin to continue.",
             )
+
+    def _refresh_connection(self):
+        self._check_version()
+        self._refresh_organizations()
 
     def _refresh_organizations(self):
         if self.dock is None:
@@ -238,6 +275,7 @@ class GeoDelPlugin:
             ),
             server_url=API_URL,
             api_key=api_key,
+            config=self._config,
         )
         self._organization_task = task
         self._organization_version = version
@@ -428,6 +466,7 @@ class GeoDelPlugin:
             server_url=server_url,
             api_key=api_key,
             organization_id=organization_id,
+            config=self._config,
         )
         self._uploads_task = task
         QgsApplication.taskManager().addTask(task)
@@ -478,6 +517,7 @@ class GeoDelPlugin:
             server_url=API_URL,
             api_key=api_key,
             organization_id=organization_id,
+            config=self._config,
         )
         self._folder_task = task
         QgsApplication.taskManager().addTask(task)
@@ -588,12 +628,15 @@ class GeoDelPlugin:
         self._update_upload_enabled()
 
     def _browse_file(self):
+        if not self._config.allowed_extensions:
+            self.iface.messageBar().pushCritical(PRODUCT_NAME, "No supported upload formats are available.")
+            return
         start = self.settings.value(f"{SETTINGS_PREFIX}/lastDirectory", "", type=str)
         filename, _ = QFileDialog.getOpenFileName(
             self.iface.mainWindow(),
             "Choose a file to share",
             start,
-            "Supported files (*.zip *.geojson *.json)",
+            f"Supported files ({' '.join('*' + extension for extension in self._config.allowed_extensions)})",
         )
         if filename:
             self._choose_file(filename)
@@ -602,9 +645,9 @@ class GeoDelPlugin:
         if self.dock is None:
             return
         path = Path(filename)
-        if path.suffix.lower() not in (".zip", ".geojson", ".json"):
+        if path.suffix.lower() not in self._config.allowed_extensions:
             self.iface.messageBar().pushCritical(
-                PRODUCT_NAME, "Choose a .zip, .geojson, or .json file."
+                PRODUCT_NAME, f"Supported upload formats are {self._config.extensions_label}."
             )
             return
         self._selected_path = path
@@ -641,6 +684,7 @@ class GeoDelPlugin:
             return
         self.dock.upload_button.setEnabled(
             (self._selected_path is not None or bool(self._selected_layers()))
+            and bool(self._config.allowed_extensions)
             and bool(self.dock.organizations.currentData())
             and bool(self.dock.upload_name.text().strip())
         )
@@ -655,10 +699,10 @@ class GeoDelPlugin:
             )
             return None
         filename = name if name.lower().endswith(suffix) else f"{name}{suffix}"
-        if len(filename) > 255:
-            self.iface.messageBar().pushCritical(
-                PRODUCT_NAME, "Upload name must be 255 characters or fewer."
-            )
+        try:
+            self._config.validate_filename(filename)
+        except ValueError as error:
+            self.iface.messageBar().pushCritical(PRODUCT_NAME, str(error))
             return None
         return filename
 
@@ -677,6 +721,7 @@ class GeoDelPlugin:
             "api_key": api_key,
             "organization_id": organization_id,
             "folder_id": self.dock.folders.currentData() or None,
+            "config": self._config,
         }
 
     def _new_upload_task(
@@ -753,9 +798,9 @@ class GeoDelPlugin:
                 PRODUCT_NAME, f"Could not read upload file: {error}"
             )
             return
-        if file_size > MAX_FILE_SIZE:
+        if file_size > self._config.max_file_size_bytes:
             self.iface.messageBar().pushCritical(
-                PRODUCT_NAME, f"File exceeds the {MAX_FILE_SIZE_LABEL} upload limit."
+                PRODUCT_NAME, f"File exceeds the {self._config.file_size_label} upload limit."
             )
             return
         if file_size == 0:
@@ -779,7 +824,7 @@ class GeoDelPlugin:
 
     def _start_layer_upload(self, layers):
         try:
-            export = LayerExport(layers)
+            export = LayerExport(layers, self._config)
         except GeoDelError as error:
             self.iface.messageBar().pushCritical(PRODUCT_NAME, str(error))
             return

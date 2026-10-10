@@ -1,3 +1,6 @@
+from dataclasses import replace
+from geodel import client as client_module
+from geodel.config import DEFAULT_CONFIG
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -5,8 +8,6 @@ import json
 from geodel.transport import Response, Transport, TransportError
 
 from geodel.client import (
-    MAX_FILE_SIZE,
-    PART_SIZE,
     AuthenticationError,
     AuthorizationError,
     GeoDelClient,
@@ -19,7 +20,7 @@ from geodel.client import (
 @pytest.fixture(autouse=True)
 def multipart_policy(monkeypatch):
     # These legacy cases exercise multipart cleanup; single PUT has its own tests.
-    monkeypatch.setattr("geodel.client.SINGLE_PUT_THRESHOLD", 0)
+    monkeypatch.setattr(client_module, "DEFAULT_CONFIG", replace(DEFAULT_CONFIG, single_put_threshold_bytes=0))
 
 
 def response(status_code, payload, headers=None):
@@ -363,7 +364,7 @@ def test_multipart_upload_sends_original_bytes_and_reports_progress(tmp_path):
     from test_upload_efficiency import UploadTransport
 
     source = tmp_path / "roads.geojson"
-    original = b"a" * PART_SIZE + b"last byte"
+    original = b"a" * DEFAULT_CONFIG.part_size_bytes + b"last byte"
     source.write_bytes(original)
     transport = UploadTransport()
     progress = []
@@ -517,7 +518,8 @@ def test_publish_returns_timeout_outcome(tmp_path):
     )
     now = [0.0]
 
-    with patch("geodel.client.POLL_TIMEOUT_SECONDS", 1), patch(
+    client.config = replace(client.config, processing_timeout_seconds=1)
+    with patch(
         "geodel.client.monotonic", side_effect=lambda: now[0]
     ), patch(
         "geodel.client.sleep",
@@ -531,7 +533,7 @@ def test_publish_returns_timeout_outcome(tmp_path):
 def test_rejects_file_over_max_size_before_request(tmp_path):
     source = tmp_path / "too-large.zip"
     with source.open("wb") as file:
-        file.truncate(MAX_FILE_SIZE + 1)
+        file.truncate(DEFAULT_CONFIG.max_file_size_bytes + 1)
     transport = MagicMock(spec=Transport)
     client = GeoDelClient(
         "https://example.com",
@@ -540,7 +542,7 @@ def test_rejects_file_over_max_size_before_request(tmp_path):
         transport=transport,
     )
 
-    with pytest.raises(GeoDelError, match="200 MB"):
+    with pytest.raises(GeoDelError, match="200 MiB"):
         client.upload_file(source, "too-large.zip", "org-1")
 
     transport.request.assert_not_called()
