@@ -62,9 +62,13 @@ def client(transport, config=None):
     return GeoDelClient("https://api.example", "synthetic-key", "0.1.2", transport, config=config)
 
 
-@pytest.mark.parametrize("limit_mib", [100, 300])
-def test_configured_file_cap_accepts_boundary_and_rejects_next_byte(tmp_path, limit_mib):
-    config = replace(module.DEFAULT_CONFIG, max_file_size_bytes=limit_mib * 1024**2)
+@pytest.mark.parametrize("limit_bytes, label", [
+    (100 * 1024**2, "100 MiB"),
+    (300 * 1024**2, "300 MiB"),
+    (200 * 1024**2 + 1, "209,715,201 bytes"),
+])
+def test_configured_file_cap_accepts_boundary_and_rejects_next_byte(tmp_path, limit_bytes, label):
+    config = replace(module.DEFAULT_CONFIG, max_file_size_bytes=limit_bytes)
     path = tmp_path / "roads.geojson"
     transport = UploadTransport()
     transport.put_hook = lambda *_: Response(200, headers={"ETag": "part"})
@@ -75,7 +79,7 @@ def test_configured_file_cap_accepts_boundary_and_rejects_next_byte(tmp_path, li
     transport.calls.clear()
     with path.open("wb") as source:
         source.truncate(config.max_file_size_bytes + 1)
-    with pytest.raises(GeoDelError, match=f"{limit_mib} MiB"):
+    with pytest.raises(GeoDelError, match=label):
         uploader.upload_file(path, path.name, "org")
     assert transport.calls == []
 
