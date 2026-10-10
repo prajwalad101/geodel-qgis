@@ -27,7 +27,9 @@ class PluginConfig:
 
     @property
     def file_size_label(self):
-        return f"{self.max_file_size_bytes / 1024**2:g} MiB"
+        if self.max_file_size_bytes % 1024**2 == 0:
+            return f"{self.max_file_size_bytes // 1024**2} MiB"
+        return f"{self.max_file_size_bytes:,} bytes"
 
     @property
     def extensions_label(self):

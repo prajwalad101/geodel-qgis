@@ -71,6 +71,19 @@ def test_lowering_the_cap_does_not_require_changing_transfer_tuning(payload):
     assert config.single_put_threshold_bytes == DEFAULT_CONFIG.single_put_threshold_bytes
 
 
+@pytest.mark.parametrize("size, label", [
+    (1024, "1,024 bytes"),
+    (1024**2, "1 MiB"),
+    (200 * 1024**2, "200 MiB"),
+    (200 * 1024**2 + 1, "209,715,201 bytes"),
+    (200 * 1024**2 + 1024, "209,716,224 bytes"),
+    (200_000_000, "200,000,000 bytes"),
+])
+def test_file_size_label_preserves_exact_metadata_limit(payload, size, label):
+    payload["maxFileSizeBytes"] = size
+    assert PluginConfig.from_metadata(payload).file_size_label == label
+
+
 def test_filename_length_matches_backend_for_non_bmp_characters():
     config = replace(DEFAULT_CONFIG, max_filename_length=10)
     config.validate_filename("📍.geojson")
