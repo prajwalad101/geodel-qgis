@@ -10,8 +10,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import QgsApplication
 
-from .client import MAX_FILE_SIZE_LABEL
-from .config import PRODUCT_NAME, WEB_URL
+from .config import DEFAULT_CONFIG, PRODUCT_NAME, WEB_URL
 
 ACCENT = "#d9532f"
 MUTED = "#8b929c"
@@ -133,14 +132,10 @@ class FileDropZone(QPushButton):
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAccessibleName("Choose a file to upload")
-        self.setAccessibleDescription(
-            f".zip, .geojson or .json, up to {MAX_FILE_SIZE_LABEL}"
-        )
 
         hint = _label("Drop a file here or click to browse", "strong")
-        types = _label(
-            f".zip · .geojson · .json  —  up to {MAX_FILE_SIZE_LABEL}", "muted"
-        )
+        self.types = _label("", "muted")
+        self.set_config(DEFAULT_CONFIG)
         self.file_path = QLineEdit()
         self.file_path.setObjectName("chosenFile")
         self.file_path.setReadOnly(True)
@@ -154,7 +149,7 @@ class FileDropZone(QPushButton):
         layout.setContentsMargins(16, 24, 16, 20)
         layout.setSpacing(6)
         layout.addStretch()
-        for label in (hint, types):
+        for label in (hint, self.types):
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             layout.addWidget(label)
@@ -162,6 +157,11 @@ class FileDropZone(QPushButton):
         layout.addWidget(self.file_path)
         layout.addStretch()
         self.setLayout(layout)
+
+    def set_config(self, config):
+        hint = f"{config.extensions_label} — up to {config.file_size_label}"
+        self.types.setText(hint)
+        self.setAccessibleDescription(hint)
 
     def dragEnterEvent(self, event):  # noqa: N802 - Qt API
         urls = event.mimeData().urls()

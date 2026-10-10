@@ -73,6 +73,56 @@ profile and restart that profile. Release builds reject development URLs;
 restore production URLs before building a candidate. Keep production credentials
 out of local service testing.
 
+## Backend metadata
+
+`GET /api/v1/meta` is public and receives `X-Plugin-Version`. It returns
+`minPluginVersion`, the echoed `pluginVersion`, and an optional `qgisPlugin`
+object with `schemaVersion: 1`. No API key or Workspace is needed. The service
+keeps its existing `Cache-Control: private, no-store` policy.
+
+| Field | Packaged default | Accepted values |
+|---|---|---|
+| `maxFileSizeBytes` | 209715200 | Positive integer, no more than `partSizeBytes × 10000` |
+| `maxProjectLayers` | 20 | Integer 1–10000 |
+| `maxFilenameLength` | 255 | Integer 1–10000, measured in JavaScript UTF-16 code units |
+| `allowedExtensions` | `[".zip", ".geojson", ".json"]` | Nonempty array of lowercase extensions; only installed handlers are enabled |
+| `singlePutThresholdBytes` | 104857600 | Integer from `partSizeBytes` to 5 GiB |
+| `partSizeBytes` | 10485760 | Integer from 5 MiB to 64 MiB |
+| `partConcurrency` | 3 | Integer 1–8; `partSizeBytes × partConcurrency` must not exceed 256 MiB |
+| `retryDelaysSeconds` | `[1, 3, 5]` | Array of up to five integers from 0 to 30; an empty array disables retries |
+| `requestTimeoutSeconds` | 15 | Integer 1–60 |
+| `uploadPartTimeoutSeconds` | 300 | Integer 1–3600 |
+| `processingTimeoutSeconds` | 600 | Integer 1–7200 |
+| `recentUploadsRefreshSeconds` | 5 | Integer 1–300 |
+| `connectionFeedbackTimeoutSeconds` | 5 | Integer 1–60 |
+
+All fields are required when `qgisPlugin` is present. Unknown fields are
+ignored. Unsupported schema versions and malformed configuration are rejected
+as a whole; the minimum-version notice is handled independently. Missing
+configuration on an older API retains the active settings. The plugin retains
+its last valid configuration in memory or uses packaged defaults; it does not
+persist configuration to QGIS settings. If the server advertises only formats
+that the installed plugin cannot handle, uploads are disabled.
+
+In the backend repository, update the shared upload/layer/name/extension
+constants for policy and `QGIS_PLUGIN_CONFIG` in API configuration for tuning.
+The metadata size derives from `MAX_FILE_SIZE_KB × 1024`; change the shared
+limit rather than overriding only the advertised size. Deploy API and worker
+changes together when changing shared policy. Deploy the additive metadata API
+before releasing this plugin. Older plugin installations keep their packaged
+limits until upgraded.
+
+Metadata loads at initialization, panel opening, manual Refresh, and every
+five minutes while visible. Requests do not overlap. Configuration is copied
+by reference as an immutable snapshot into layer preparation and upload tasks;
+refreshes never modify an active upload. Backend validation remains authoritative,
+so a lowered limit can reject an upload started with older settings.
+
+API/Web origins, export CRS/implementation, credentials, network security,
+and the five-minute metadata refresh cadence remain packaged. Feature switches,
+maintenance notices, and editable admin settings are deferred. Metadata changes
+cannot add a parser, UI workflow, or execute downloaded code.
+
 ## Issue triage
 
 Use these five canonical triage labels:

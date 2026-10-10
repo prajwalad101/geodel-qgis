@@ -1,4 +1,5 @@
 """Upload policy and concurrency checks at the real client boundary."""
+from dataclasses import replace
 from contextlib import nullcontext
 import json
 from pathlib import Path
@@ -57,8 +58,61 @@ class UploadTransport:
         return Response(200, json.dumps(payload).encode())
 
 
-def client(transport):
-    return GeoDelClient("https://api.example", "synthetic-key", "0.1.2", transport)
+def client(transport, config=None):
+    return GeoDelClient("https://api.example", "synthetic-key", "0.1.2", transport, config=config)
+
+
+@pytest.mark.parametrize("limit_mib", [100, 300])
+def test_configured_file_cap_accepts_boundary_and_rejects_next_byte(tmp_path, limit_mib):
+    config = replace(module.DEFAULT_CONFIG, max_file_size_bytes=limit_mib * 1024**2)
+    path = tmp_path / "roads.geojson"
+    transport = UploadTransport()
+    transport.put_hook = lambda *_: Response(200, headers={"ETag": "part"})
+    with path.open("wb") as source:
+        source.truncate(config.max_file_size_bytes)
+    uploader = client(transport, config)
+    assert uploader.upload_file(path, path.name, "org") == "upload"
+    transport.calls.clear()
+    with path.open("wb") as source:
+        source.truncate(config.max_file_size_bytes + 1)
+    with pytest.raises(GeoDelError, match=f"{limit_mib} MiB"):
+        uploader.upload_file(path, path.name, "org")
+    assert transport.calls == []
+
+
+def test_configured_extensions_and_name_limit_are_enforced_before_requests(tmp_path):
+    path = tmp_path / "roads.geojson"
+    path.write_bytes(b"{}")
+    config = replace(module.DEFAULT_CONFIG, allowed_extensions=(".json",), max_filename_length=13)
+    transport = UploadTransport()
+    uploader = client(transport, config)
+    with pytest.raises(GeoDelError, match="formats are .json"):
+        uploader.upload_file(path, "roads.geojson", "org")
+    with pytest.raises(GeoDelError, match="13 characters"):
+        uploader.upload_file(path, "123456789.json", "org")
+    assert transport.calls == []
+
+
+def test_configured_transfer_tuning_and_timeouts_are_used(tmp_path, monkeypatch):
+    path = tmp_path / "roads.geojson"
+    path.write_bytes(b"123456789")
+    transport = UploadTransport()
+    config = replace(module.DEFAULT_CONFIG, single_put_threshold_bytes=8, part_size_bytes=4,
+                     part_concurrency=1, request_timeout_seconds=23, upload_part_timeout_seconds=123,
+                     retry_delays_seconds=(0,))
+    monkeypatch.setattr(module, "sleep", lambda _: None)
+    attempts = []
+    def put(url, _options):
+        attempts.append(url)
+        if len(attempts) == 1:
+            return Response(503)
+    transport.put_hook = put
+    assert client(transport, config).upload_file(path, path.name, "org") == "upload"
+    assert [len(transport.parts[f"/{n}"]) for n in range(1, 4)] == [4, 4, 1]
+    assert attempts == ["https://storage.example/1", "https://storage.example/1",
+                        "https://storage.example/2", "https://storage.example/3"]
+    assert all(options["timeout"] == (123 if method == "PUT" else 23)
+               for method, _, options in transport.calls)
 
 
 def test_small_file_streams_without_multipart_and_registers_last(tmp_path):
@@ -88,8 +142,8 @@ def test_single_put_threshold(tmp_path, size, multipart):
 
 
 def test_three_parts_overlap_and_complete_in_order(tmp_path, monkeypatch):
-    monkeypatch.setattr(module, "SINGLE_PUT_THRESHOLD", 0, raising=False)
-    monkeypatch.setattr(module, "PART_SIZE", 8)
+    monkeypatch.setattr(module, "DEFAULT_CONFIG", replace(module.DEFAULT_CONFIG, single_put_threshold_bytes=0))
+    monkeypatch.setattr(module, "DEFAULT_CONFIG", replace(module.DEFAULT_CONFIG, part_size_bytes=8))
     path = tmp_path / "roads.geojson"
     original = bytes(range(47))
     path.write_bytes(original)
@@ -105,8 +159,8 @@ def test_three_parts_overlap_and_complete_in_order(tmp_path, monkeypatch):
 
 
 def test_at_most_three_part_buffers_remain_live(tmp_path, monkeypatch):
-    monkeypatch.setattr(module, "SINGLE_PUT_THRESHOLD", 0)
-    monkeypatch.setattr(module, "PART_SIZE", 8)
+    monkeypatch.setattr(module, "DEFAULT_CONFIG", replace(module.DEFAULT_CONFIG, single_put_threshold_bytes=0))
+    monkeypatch.setattr(module, "DEFAULT_CONFIG", replace(module.DEFAULT_CONFIG, part_size_bytes=8))
     path = tmp_path / "roads.geojson"
     path.write_bytes(b"x" * 72)
     transport = UploadTransport()
@@ -201,8 +255,8 @@ def test_cancel_during_retry_wait(tmp_path, monkeypatch):
 
 
 def test_failed_part_stops_siblings_before_cleanup(tmp_path, monkeypatch):
-    monkeypatch.setattr(module, "SINGLE_PUT_THRESHOLD", 0)
-    monkeypatch.setattr(module, "PART_SIZE", 8)
+    monkeypatch.setattr(module, "DEFAULT_CONFIG", replace(module.DEFAULT_CONFIG, single_put_threshold_bytes=0))
+    monkeypatch.setattr(module, "DEFAULT_CONFIG", replace(module.DEFAULT_CONFIG, part_size_bytes=8))
     path = tmp_path / "roads.geojson"
     path.write_bytes(bytes(range(47)))
     transport = UploadTransport()
@@ -257,7 +311,7 @@ def test_retry_after_is_capped_and_honored(tmp_path, monkeypatch):
 
 
 def test_part_signing_retries_without_creating_a_second_attempt(tmp_path, monkeypatch):
-    monkeypatch.setattr(module, "SINGLE_PUT_THRESHOLD", 0)
+    monkeypatch.setattr(module, "DEFAULT_CONFIG", replace(module.DEFAULT_CONFIG, single_put_threshold_bytes=0))
     monkeypatch.setattr(module, "sleep", lambda _: None)
     path = tmp_path / "roads.geojson"
     path.write_bytes(b"bytes")
@@ -291,7 +345,7 @@ def test_tls_failure_is_not_retried(tmp_path):
 
 @pytest.mark.parametrize("stage", ["/complete", "/register"])
 def test_finalization_is_not_retried(tmp_path, monkeypatch, stage):
-    monkeypatch.setattr(module, "SINGLE_PUT_THRESHOLD", 0)
+    monkeypatch.setattr(module, "DEFAULT_CONFIG", replace(module.DEFAULT_CONFIG, single_put_threshold_bytes=0))
     path = tmp_path / "roads.geojson"
     path.write_bytes(b"bytes")
     transport = UploadTransport()
@@ -310,7 +364,7 @@ def test_finalization_is_not_retried(tmp_path, monkeypatch, stage):
 @pytest.mark.parametrize("cancel_before_registration", [False, True])
 def test_registration_finishes_if_cancel_arrives_after_it_starts(tmp_path, monkeypatch, multipart, cancel_before_registration):
     if multipart:
-        monkeypatch.setattr(module, "SINGLE_PUT_THRESHOLD", 0)
+        monkeypatch.setattr(module, "DEFAULT_CONFIG", replace(module.DEFAULT_CONFIG, single_put_threshold_bytes=0))
     path = tmp_path / "roads.geojson"
     path.write_bytes(b"synthetic")
     canceled = Event()
@@ -343,9 +397,9 @@ def test_registration_finishes_if_cancel_arrives_after_it_starts(tmp_path, monke
 @pytest.mark.parametrize("mutation", ["same_size_edit", "replacement"])
 @pytest.mark.parametrize("stage", ["initialization", "before_read", "after_read", "last_put", "before_completion"])
 def test_multipart_source_mutations_abort_before_completion(tmp_path, monkeypatch, mutation, stage):
-    monkeypatch.setattr(module, "SINGLE_PUT_THRESHOLD", 0)
-    monkeypatch.setattr(module, "PART_SIZE", 8)
-    monkeypatch.setattr(module, "PART_CONCURRENCY", 1)
+    monkeypatch.setattr(module, "DEFAULT_CONFIG", replace(module.DEFAULT_CONFIG, single_put_threshold_bytes=0))
+    monkeypatch.setattr(module, "DEFAULT_CONFIG", replace(module.DEFAULT_CONFIG, part_size_bytes=8))
+    monkeypatch.setattr(module, "DEFAULT_CONFIG", replace(module.DEFAULT_CONFIG, part_concurrency=1))
     path = tmp_path / "roads.geojson"
     path.write_bytes(b"x" * 24)
     transport = UploadTransport()

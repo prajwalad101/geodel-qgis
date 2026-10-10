@@ -1,4 +1,5 @@
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 from zipfile import ZipFile
@@ -135,6 +136,18 @@ sys.modules.setdefault("qgis.core", core)
 
 from geodel.client import GeoDelError
 from geodel.layer_export import LayerExport
+from geodel.config import DEFAULT_CONFIG
+
+
+def test_remote_layer_count_and_export_format_are_checked_before_preparation():
+    import pytest
+
+    with pytest.raises(GeoDelError, match="no more than 1 layers"):
+        LayerExport([Layer("Roads"), Layer("Places")], replace(DEFAULT_CONFIG, max_project_layers=1))
+    with pytest.raises(GeoDelError, match="requires .zip"):
+        LayerExport([Layer("Roads"), Layer("Places")], replace(DEFAULT_CONFIG, allowed_extensions=(".geojson",)))
+    with pytest.raises(GeoDelError, match="requires .geojson"):
+        LayerExport([Layer("Roads")], replace(DEFAULT_CONFIG, allowed_extensions=(".zip",)))
 
 
 def test_prepares_zipped_shapefiles_with_safe_unique_names_and_owned_cleanup():
