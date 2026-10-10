@@ -1,3 +1,6 @@
+from dataclasses import replace
+from geodel import client as client_module
+from geodel.config import DEFAULT_CONFIG
 """Client behavior at the injected HTTP boundary, without QGIS imports."""
 import json
 
@@ -9,7 +12,7 @@ from geodel.client import GeoDelClient
 
 @pytest.fixture(autouse=True)
 def multipart_policy(monkeypatch):
-    monkeypatch.setattr("geodel.client.SINGLE_PUT_THRESHOLD", 0)
+    monkeypatch.setattr(client_module, "DEFAULT_CONFIG", replace(DEFAULT_CONFIG, single_put_threshold_bytes=0))
 
 
 class FixtureTransport(Transport):

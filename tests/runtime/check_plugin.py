@@ -4,6 +4,8 @@ Only the QgisInterface host and service responses are adapted. No Qt/QGIS
 classes are stubbed. Run with scripts/test-qgis.py in QGIS's Python environment.
 """
 from contextlib import ExitStack
+from dataclasses import replace
+import json
 import os
 from pathlib import Path
 import sys
@@ -91,6 +93,9 @@ class PluginRuntimeTests(unittest.TestCase):
             "geodel.qgis_transport.QgisTransport.request",
             side_effect=AssertionError("Network forbidden in runtime tests"),
         ))
+        self.metadata = self.patches.enter_context(patch.object(
+            GeoDelClient, "get_meta", return_value={"minPluginVersion": "0.1.0"},
+        ))
         self.version = self.patches.enter_context(patch.object(
             GeoDelClient, "requires_update", return_value=False,
         ))
@@ -133,6 +138,155 @@ class PluginRuntimeTests(unittest.TestCase):
         )
         self.assertTrue(loaded)
         return config.config("password")
+
+    def test_metadata_updates_limits_hints_accessibility_and_timers(self):
+        from geodel.config import PluginConfig
+        from geodel.plugin import METADATA_REFRESH_MILLISECONDS
+
+        payload = json.loads(Path(__file__).parents[1].joinpath("fixtures/plugin_metadata.json").read_text())
+        payload["qgisPlugin"].update(maxFileSizeBytes=300 * 1024**2, allowedExtensions=[".json"],
+                                    recentUploadsRefreshSeconds=12, connectionFeedbackTimeoutSeconds=9)
+        self.metadata.return_value = payload
+        self.plugin.initGui()
+        wait_until(lambda: self.plugin._version_task is None)
+        self.assertEqual(self.metadata.call_count, 1)
+        self.assertEqual(self.plugin._config, PluginConfig.from_metadata(payload["qgisPlugin"]))
+        zone = self.plugin.dock.browse_button
+        self.assertEqual(zone.types.text(), ".json — up to 300 MiB")
+        self.assertEqual(zone.accessibleDescription(), zone.types.text())
+        self.assertEqual(self.plugin._recent_timer.interval(), 12_000)
+        self.assertEqual(self.plugin._organization_timer.interval(), 9_000)
+        self.assertEqual(self.plugin._metadata_timer.interval(), METADATA_REFRESH_MILLISECONDS)
+        self.assertFalse(self.plugin._metadata_timer.isActive())
+        self.plugin.action.trigger()
+        wait_until(lambda: self.metadata.call_count == 2 and self.plugin._version_task is None)
+        self.assertTrue(self.plugin._metadata_timer.isActive())
+        self.plugin._metadata_timer.timeout.emit()
+        wait_until(lambda: self.metadata.call_count == 3 and self.plugin._version_task is None)
+        self.plugin.dock.refresh_requested.emit()
+        wait_until(lambda: self.metadata.call_count == 4 and self.plugin._version_task is None)
+        self.plugin.action.trigger()
+        self.assertFalse(self.plugin._metadata_timer.isActive())
+
+    def test_metadata_failure_invalid_and_legacy_responses_retain_valid_config(self):
+        from geodel.client import GeoDelError
+        from geodel.config import DEFAULT_CONFIG
+
+        self.metadata.side_effect = GeoDelError("synthetic failure")
+        self.plugin.initGui()
+        wait_until(lambda: self.plugin._version_task is None)
+        self.assertEqual(self.plugin._config, DEFAULT_CONFIG)
+        payload = json.loads(Path(__file__).parents[1].joinpath("fixtures/plugin_metadata.json").read_text())
+        payload["qgisPlugin"]["maxFileSizeBytes"] = 100 * 1024**2
+        self.metadata.side_effect = None
+        self.metadata.return_value = payload
+        self.plugin._check_version()
+        wait_until(lambda: self.plugin._version_task is None)
+        config = self.plugin._config
+        self.assertEqual(config.max_file_size_bytes, 100 * 1024**2)
+        for outcome in (GeoDelError("unavailable"), {**payload, "qgisPlugin": {"schemaVersion": 2}},
+                        {"minPluginVersion": "0.1.0"}):
+            self.metadata.side_effect = outcome if isinstance(outcome, Exception) else None
+            self.metadata.return_value = outcome
+            self.plugin._check_version()
+            wait_until(lambda: self.plugin._version_task is None)
+            self.assertIs(self.plugin._config, config)
+            self.assertIn("100 MiB", self.plugin.dock.browse_button.types.text())
+
+    def test_invalid_configuration_preserves_update_notice(self):
+        self.metadata.return_value = {"minPluginVersion": "99.0.0", "qgisPlugin": {"schemaVersion": 2}}
+        self.version.return_value = True
+        self.plugin.initGui()
+        wait_until(lambda: self.plugin._version_task is None)
+        self.assertFalse(self.plugin.dock.update_notice.isHidden())
+
+    def test_file_selection_filter_and_validation_follow_remote_config(self):
+        from geodel.config import DEFAULT_CONFIG
+
+        self.prepare_file_upload()
+        self.plugin._config = replace(DEFAULT_CONFIG, allowed_extensions=(".json",), max_filename_length=12)
+        path = Path(os.environ["GEODEL_RUNTIME_ROOT"]) / "roads.json"
+        path.write_text("{}")
+        with patch("geodel.plugin.QFileDialog.getOpenFileName", return_value=(str(path), "")) as browse:
+            self.plugin._browse_file()
+            self.assertEqual(browse.call_args.args[-1], "Supported files (*.json)")
+        self.assertEqual(self.plugin._selected_path, path)
+        self.plugin.dock.browse_button.file_dropped.emit(str(path.with_suffix(".zip")))
+        self.assertEqual(self.plugin._selected_path, path)
+        self.plugin.dock.upload_name.setText("12345678")
+        self.assertIsNone(self.plugin._upload_filename(".json"))
+        self.plugin.dock.upload_name.setText("Roads")
+        self.assertEqual(self.plugin._upload_filename(".json"), "Roads.json")
+        self.assertIsNone(self.plugin._upload_filename(".geojson"))
+
+    def test_existing_selected_file_is_rechecked_after_policy_changes(self):
+        from geodel.config import DEFAULT_CONFIG
+
+        self.prepare_file_upload()
+        self.plugin._config = replace(DEFAULT_CONFIG, max_file_size_bytes=1)
+        with patch.object(self.plugin, "_new_upload_task") as upload:
+            self.plugin._start_upload()
+            upload.assert_not_called()
+        self.plugin._config = replace(DEFAULT_CONFIG, allowed_extensions=(".zip",))
+        with patch.object(self.plugin, "_new_upload_task") as upload:
+            self.plugin._start_upload()
+            upload.assert_not_called()
+
+    def test_upload_worker_keeps_destination_config_snapshot(self):
+        from geodel.client import GeoDelClient
+        from geodel.config import DEFAULT_CONFIG
+
+        self.prepare_file_upload()
+        original = replace(DEFAULT_CONFIG, max_file_size_bytes=300 * 1024**2)
+        self.plugin._config = original
+        destination = self.plugin._upload_destination()
+        self.plugin._config = replace(DEFAULT_CONFIG, max_file_size_bytes=100 * 1024**2)
+        task = self.plugin._new_upload_task(self.plugin._selected_path, "roads.geojson", destination,
+                                            self.plugin._connection_version)
+        observed = []
+        def upload(client, *_args):
+            observed.append(client.config)
+            return "upload-1"
+        with patch.object(GeoDelClient, "upload_file", upload):
+            self.plugin._run_upload_task(task)
+            wait_until(lambda: self.plugin._upload_task is None)
+        self.assertEqual(observed, [original])
+
+    def test_layer_export_handoff_keeps_starting_config(self):
+        from geodel.client import GeoDelClient
+        from geodel.config import DEFAULT_CONFIG
+        from qgis.core import QgsFeature, QgsGeometry, QgsVectorLayer
+
+        self.prepare_file_upload()
+        project = QgsProject.instance()
+        self.addCleanup(project.clear)
+        observed = []
+        def upload(client, path, *_args):
+            self.assertGreater(path.stat().st_size, 1)
+            observed.append(client.config)
+            return "upload-1"
+        original_task = self.plugin._new_layer_export_task
+        def prepare(export, version, filename, destination):
+            self.plugin._config = replace(DEFAULT_CONFIG, max_file_size_bytes=1, allowed_extensions=())
+            return original_task(export, version, filename, destination)
+        with patch.object(GeoDelClient, "upload_file", upload), \
+                patch.object(self.plugin, "_new_layer_export_task", side_effect=prepare):
+            for count in (1, 2):
+                original = replace(DEFAULT_CONFIG, max_project_layers=count)
+                self.plugin._config = original
+                project.clear()
+                for number in range(count):
+                    layer = QgsVectorLayer("Point?crs=EPSG:4326", f"roads-{number}", "memory")
+                    feature = QgsFeature(layer.fields())
+                    feature.setGeometry(QgsGeometry.fromWkt("POINT (1 2)"))
+                    layer.dataProvider().addFeatures([feature])
+                    layer.updateExtents()
+                    project.addMapLayer(layer)
+                for index in range(self.plugin.dock.layers.count()):
+                    self.plugin.dock.layers.item(index).setSelected(True)
+                self.plugin.dock.upload_button.click()
+                wait_until(lambda: self.plugin._upload_task is None)
+                self.assertIs(observed[-1], original)
 
     def test_entry_point_open_close_unload_and_reload(self):
         for _ in range(2):
@@ -209,7 +363,7 @@ class PluginRuntimeTests(unittest.TestCase):
     def test_unload_cancels_active_task_and_ignores_late_completion_after_reload(self):
         started, release = Event(), Event()
 
-        def delayed_version():
+        def delayed_version(_metadata=None):
             started.set()
             release.wait(5)
             return True
@@ -217,9 +371,12 @@ class PluginRuntimeTests(unittest.TestCase):
         self.version.side_effect = delayed_version
         self.plugin.initGui()
         wait_until(started.is_set)
+        self.plugin._check_version()
+        self.plugin._check_version()
+        self.assertEqual(self.metadata.call_count, 1)
         old_task = next(
             task for task in QgsApplication.taskManager().tasks()
-            if task.description() == "Check GeoDel plugin version"
+            if task.description() == "Load GeoDel plugin metadata"
         )
         self.plugin.unload()
         self.assertTrue(old_task.isCanceled())

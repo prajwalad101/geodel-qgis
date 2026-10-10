@@ -13,10 +13,10 @@ upload layers and copy share links without leaving QGIS.
 
 ## Install and connect
 
-Version **0.1.1** is a release candidate. Official QGIS Plugin Repository
+Version **0.1.2** is a release candidate. Official QGIS Plugin Repository
 acceptance and manual platform verification are pending; use ZIP installation.
 
-1. Obtain the verified `geodel-0.1.1.zip` from the candidate's successful
+1. Obtain the verified `geodel-0.1.2.zip` from the candidate's successful
    [GitHub Actions run](https://github.com/prajwalad101/geodel-qgis/actions).
    Check its accompanying SHA-256 checksum. Contributors can build it locally
    using [these instructions](CONTRIBUTING.md#contributor-setup-and-checks).
@@ -38,10 +38,16 @@ acceptance and manual platform verification are pending; use ZIP installation.
 
 One project layer exports as **GeoJSON**; multiple layers export as **zipped
 Shapefiles**, using EPSG:4326. Browse uploads `.geojson`, `.json`, or `.zip`
-files unchanged. Limits are **20 project layers** and **200 MiB per upload**
-(shown as 200 MB in the panel). Raster and empty layers are unsupported.
-Files up to 100 MiB use a single streamed transfer; larger files upload three
+files unchanged. GeoDel supplies the upload limits and accepted file types;
+packaged defaults are **20 project layers** and **200 MiB per upload**. The
+panel shows the current file limit. Raster and empty layers are unsupported.
+Transfer defaults use a single streamed upload up to 100 MiB, then three
 10 MiB parts concurrently. Temporary transfer failures retry automatically.
+
+Settings refresh when the panel opens, when you choose **Refresh**, and every
+five minutes while the panel stays open. An upload keeps its starting settings.
+If settings cannot be loaded, the plugin retains valid settings from this
+session or uses packaged defaults; GeoDel still enforces its current limits.
 
 Choose **Cancel upload** to stop layer preparation or a file transfer. Wait for
 cancellation to finish before retrying. Already registered files remain in

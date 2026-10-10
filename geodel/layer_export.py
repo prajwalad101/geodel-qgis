@@ -13,10 +13,9 @@ from qgis.core import (
 )
 
 from .client import GeoDelError
-from .config import PRODUCT_NAME
+from .config import DEFAULT_CONFIG, PRODUCT_NAME
 
 
-MAX_LAYERS = 20
 TARGET_CRS = QgsCoordinateReferenceSystem("EPSG:4326")
 
 
@@ -31,14 +30,16 @@ class UploadArtifact:
 
 
 class LayerExport:
-    def __init__(self, layers):
+    def __init__(self, layers, config=DEFAULT_CONFIG):
         self.layers = list(layers)
         self._error = None
         self._artifact = None
         self._output_paths = []
         self._next_layer = 0
-        if len(self.layers) > MAX_LAYERS:
-            raise GeoDelError(f"Choose no more than {MAX_LAYERS} layers.")
+        if len(self.layers) > config.max_project_layers:
+            raise GeoDelError(f"Choose no more than {config.max_project_layers} layers.")
+        if self.suffix not in config.allowed_extensions:
+            raise GeoDelError(f"Layer export requires {self.suffix}, which is unavailable for upload.")
         for layer in self.layers:
             if not layer.isValid():
                 raise GeoDelError(f'Layer "{layer.name()}" could not be read.')

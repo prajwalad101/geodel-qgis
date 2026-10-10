@@ -19,7 +19,7 @@ you to set or unlock its master password. Keep that password available.
 
 ## Upload and share
 
-Choose your Workspace and destination folder (or Files root). Select 1–20
+Choose your Workspace and destination folder (or Files root). Select
 vector layers from the current QGIS project and edit the upload name. One layer
 exports as GeoJSON; multiple layers export as a ZIP of Shapefiles. Project
 exports use EPSG:4326. Empty layers and raster layers are unsupported.
@@ -28,19 +28,27 @@ Shapefile field-name/type limitations apply to multi-layer exports.
 Use **Browse…** to upload an existing `.geojson`, `.json`, or `.zip` unchanged
 (the ZIP should contain supported vector data such as Shapefiles). File
 extensions alone do not guarantee valid data; GeoDel validates/processes the
-contents. Maximum upload size is **200 MiB (209,715,200 bytes)**, shown as 200 MB
-in the panel. Limit applies to the final file, including project exports.
+contents. GeoDel supplies accepted file types and upload limits; packaged
+defaults are **20 project layers** and **200 MiB (209,715,200 bytes)** per upload.
+The panel shows the current file limit, which applies to the final file,
+including project exports.
+
+Settings refresh on opening, manual **Refresh**, and every five minutes while
+the panel is open. Uploads keep their starting settings. If metadata is
+unavailable or invalid, valid settings from this session remain in use, or
+packaged defaults apply before the first successful fetch. GeoDel still
+enforces its current server limits.
 Choose **Cancel upload** during layer preparation or transfer to stop the task.
 Wait for cancellation to finish before retrying; the selected source and name
 are retained. A file already registered with GeoDel remains in Recent uploads.
-Files up to 100 MiB use one streamed PUT; larger files upload three 10 MiB
-parts concurrently. Part-signing requests and storage PUTs retry temporary
+By default, files up to 100 MiB use one streamed PUT; larger files upload three
+10 MiB parts concurrently. GeoDel also supplies transfer and timing settings. Part-signing requests and storage PUTs retry temporary
 network/server failures up to three times with a short delay. Initialization,
 completion and registration requests do not retry. Each transfer attempt can
 take up to five minutes; QGIS network inactivity settings also apply. Progress
 reaches 100% after registration. Once registration starts, cancellation waits
-for its result (up to 15 seconds); a successful registration remains uploaded.
-Names cannot contain `/`.
+for its result (15 seconds by default); a successful registration remains uploaded.
+Names cannot contain `/` or `\`.
 
 Upload runs in QGIS Task Manager. Recent uploads refresh while the panel is
 open. When ready, choose **Copy link** in the list or **Copy share link** in
@@ -87,7 +95,7 @@ information before uploading sensitive data.
   TLS verification. Refresh after correcting settings.
 - Authentication Manager locked: unlock with the QGIS master password. Consult
   QGIS guidance before resetting its store; resetting can remove other credentials.
-- Upload rejected: check supported formats, nonempty vectors, 20-layer limit,
+- Upload rejected: check supported formats, nonempty vectors, current layer limit,
   final file size and upload name. Inspect processing details in GeoDel.
 - Update required: obtain the newer plugin version when the service requires it.
 

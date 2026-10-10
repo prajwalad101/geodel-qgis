@@ -15,18 +15,8 @@ from .transport import (
     validate_upload_file,
 )
 
-from .config import PRODUCT_NAME
+from .config import DEFAULT_CONFIG, PRODUCT_NAME, PluginConfig
 from .recent_upload import RecentUpload, project_recent_upload
-
-
-PART_SIZE = 10 * 1024 * 1024
-SINGLE_PUT_THRESHOLD = 100 * 1024 * 1024
-PART_CONCURRENCY = 3
-RETRY_DELAYS = (1, 3, 5)
-MAX_FILE_SIZE = 200 * 1024 * 1024
-MAX_FILE_SIZE_LABEL = f"{MAX_FILE_SIZE // (1024 * 1024)} MB"
-UPLOAD_PART_TIMEOUT_SECONDS = 5 * 60
-POLL_TIMEOUT_SECONDS = 10 * 60
 
 
 class GeoDelError(Exception):
@@ -57,6 +47,7 @@ class GeoDelClient:
         plugin_version: str,
         transport: Transport,
         is_canceled: Optional[Callable[[], bool]] = None,
+        config: Optional[PluginConfig] = None,
     ) -> None:
         base_url = base_url.rstrip("/")
         self.base_url = (
@@ -66,6 +57,7 @@ class GeoDelClient:
         self.plugin_version = plugin_version
         self.transport = transport
         self.is_canceled = is_canceled
+        self.config = config if config is not None else DEFAULT_CONFIG
 
     def list_organizations(self) -> List[Dict[str, Any]]:
         payload = self._get("/organizations")
@@ -87,8 +79,8 @@ class GeoDelClient:
             raise GeoDelError(f"{PRODUCT_NAME} returned invalid plugin metadata")
         return payload
 
-    def requires_update(self) -> bool:
-        minimum = self.get_meta()["minPluginVersion"]
+    def requires_update(self, metadata: Optional[Dict[str, Any]] = None) -> bool:
+        minimum = (metadata if metadata is not None else self.get_meta())["minPluginVersion"]
         try:
             installed_version = _version_tuple(self.plugin_version)
         except ValueError as error:
@@ -141,9 +133,13 @@ class GeoDelClient:
 
         if file_size == 0:
             raise GeoDelError("Upload file is empty")
-        if file_size > MAX_FILE_SIZE:
-            raise GeoDelError(f"Upload file exceeds the {MAX_FILE_SIZE_LABEL} limit")
+        if file_size > self.config.max_file_size_bytes:
+            raise GeoDelError(f"Upload file exceeds the {self.config.file_size_label} limit")
 
+        try:
+            self.config.validate_filename(filename)
+        except ValueError as error:
+            raise GeoDelError(str(error)) from error
         upload_format, content_type = _upload_type(filename)
         if is_canceled and is_canceled():
             raise UploadCanceled("Upload canceled")
@@ -163,7 +159,7 @@ class GeoDelClient:
                     progress(min(99, sum(sent.values()) / file_size * 100))
 
         with self.transport.session():
-            if file_size <= SINGLE_PUT_THRESHOLD:
+            if file_size <= self.config.single_put_threshold_bytes:
                 signed = self._get(
                     "/uploads/s3/params", organization_id,
                     params={"filename": filename, "type": content_type,
@@ -228,7 +224,7 @@ class GeoDelClient:
     def _upload_parts(self, path, file_stat, attempt_id, key, organization_id, report, is_canceled):
         file_size = file_stat.st_size
         pending: Queue[int] = Queue()
-        for number in range(1, (file_size + PART_SIZE - 1) // PART_SIZE + 1):
+        for number in range(1, (file_size + self.config.part_size_bytes - 1) // self.config.part_size_bytes + 1):
             pending.put(number)
         stopped = Event()
         parts = []
@@ -247,8 +243,8 @@ class GeoDelClient:
                             number = pending.get_nowait()
                         except Empty:
                             return
-                        size = min(PART_SIZE, file_size - (number - 1) * PART_SIZE)
-                        source.seek((number - 1) * PART_SIZE)
+                        size = min(self.config.part_size_bytes, file_size - (number - 1) * self.config.part_size_bytes)
+                        source.seek((number - 1) * self.config.part_size_bytes)
                         validate_upload_file(path, file_stat, source.fileno())
                         chunk = source.read(size)
                         validate_upload_file(path, file_stat, source.fileno())
@@ -273,8 +269,8 @@ class GeoDelClient:
                         failures.append(error)
                         stopped.set()
 
-        with ThreadPoolExecutor(max_workers=PART_CONCURRENCY) as pool:
-            futures = [pool.submit(worker) for _ in range(min(PART_CONCURRENCY, pending.qsize()))]
+        with ThreadPoolExecutor(max_workers=self.config.part_concurrency) as pool:
+            futures = [pool.submit(worker) for _ in range(min(self.config.part_concurrency, pending.qsize()))]
             for future in futures:
                 future.result()
         if failures:
@@ -305,7 +301,7 @@ class GeoDelClient:
         delay = 3.0
         status_errors = 0
         share_token_errors = 0
-        while monotonic() - started < POLL_TIMEOUT_SECONDS:
+        while monotonic() - started < self.config.processing_timeout_seconds:
             if is_canceled and is_canceled():
                 raise UploadCanceled("Upload canceled")
             try:
@@ -339,7 +335,7 @@ class GeoDelClient:
 
             elapsed = monotonic() - started
             if progress:
-                progress(min(99, 90 + elapsed / POLL_TIMEOUT_SECONDS * 9))
+                progress(min(99, 90 + elapsed / self.config.processing_timeout_seconds * 9))
             wait_until = monotonic() + delay
             while monotonic() < wait_until:
                 if is_canceled and is_canceled():
@@ -403,7 +399,7 @@ class GeoDelClient:
                 method,
                 f"{self.base_url}{path}",
                 headers=headers,
-                timeout=15,
+                timeout=self.config.request_timeout_seconds,
                 is_canceled=kwargs.pop("is_canceled", None) or self.is_canceled,
                 retry=kwargs.pop("retry", False),
                 **{key: value for key, value in kwargs.items() if value is not None},
@@ -430,21 +426,21 @@ class GeoDelClient:
         return payload
 
     def _send(self, method, url, *, is_canceled=None, retry=False, **options):
-        for attempt in range(len(RETRY_DELAYS) + 1):
+        for attempt in range(len(self.config.retry_delays_seconds) + 1):
             if is_canceled and is_canceled():
                 raise TransportCanceled("Request canceled")
             response = None
             try:
                 response = self.transport.request(method, url, is_canceled=is_canceled, **options)
             except (TransportConnectionError, TransportTimeout):
-                if not retry or attempt == len(RETRY_DELAYS):
+                if not retry or attempt == len(self.config.retry_delays_seconds):
                     raise
             else:
                 if not retry or not (response.status_code in (408, 429) or response.status_code >= 500):
                     return response
-                if attempt == len(RETRY_DELAYS):
+                if attempt == len(self.config.retry_delays_seconds):
                     return response
-            delay = RETRY_DELAYS[attempt] + randbelow(251) / 1000
+            delay = self.config.retry_delays_seconds[attempt] + randbelow(251) / 1000
             if response:
                 delay = max(delay, _retry_after(response))
             while delay > 0:
@@ -465,7 +461,7 @@ class GeoDelClient:
     ) -> str:
         try:
             response = self._send(
-                "PUT", url, data=data, timeout=UPLOAD_PART_TIMEOUT_SECONDS,
+                "PUT", url, data=data, timeout=self.config.upload_part_timeout_seconds,
                 is_canceled=is_canceled or self.is_canceled, retry=True,
                 **({"headers": headers} if headers else {}),
                 **({"upload_progress": upload_progress} if upload_progress else {}),
