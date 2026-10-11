@@ -1,7 +1,7 @@
 from dataclasses import replace
 from geodel import client as client_module
 from geodel.config import DEFAULT_CONFIG
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock
 
 import pytest
 import json
@@ -13,7 +13,6 @@ from geodel.client import (
     GeoDelClient,
     GeoDelError,
     ServerUnavailableError,
-    UploadCanceled,
 )
 
 
@@ -374,160 +373,6 @@ def test_multipart_upload_sends_original_bytes_and_reports_progress(tmp_path):
     assert transport.calls[-1][2]["json"] == {"attemptId": "attempt", "folderId": "folder-1"}
     assert progress == sorted(progress)
     assert progress[-1] == 100.0
-
-
-def test_reads_upload_status_and_share_token():
-    transport = MagicMock(spec=Transport)
-    transport.request.side_effect = [
-        response(
-            200,
-            {
-                "id": "upload-1",
-                "status": "processing",
-                "errorMessage": None,
-            },
-        ),
-        response(200, {"shareToken": "share-1"}),
-    ]
-    client = GeoDelClient(
-        "https://example.com",
-        "geodel_secret",
-        "0.1.0",
-        transport=transport,
-    )
-
-    assert client.get_upload_status("upload-1", "org-1") == {
-        "id": "upload-1",
-        "status": "processing",
-        "errorMessage": None,
-    }
-    assert client.get_share_token("upload-1", "org-1") == "share-1"
-
-
-def test_publishes_file_until_share_link_is_ready(tmp_path):
-    source = tmp_path / "roads.geojson"
-    source.write_text("{}")
-    client = GeoDelClient(
-        "https://example.com",
-        "geodel_secret",
-        "0.1.0",
-        transport=MagicMock(spec=Transport),
-    )
-    client.upload_file = Mock(
-        side_effect=lambda *args: (args[4](50), "upload-1")[1]
-    )
-    client.get_upload_status = Mock(
-        return_value={
-            "id": "upload-1",
-            "status": "ready",
-            "errorMessage": None,
-        }
-    )
-    client.get_share_token = Mock(return_value="share-1")
-    progress = []
-
-    result = client.publish_file(
-        source,
-        "roads.geojson",
-        "org-1",
-        progress=progress.append,
-    )
-
-    assert result == {"shareToken": "share-1", "timedOut": False}
-    assert progress == [45, 100]
-
-
-def test_publish_retries_transient_status_and_share_link_errors(tmp_path):
-    source = tmp_path / "roads.geojson"
-    source.write_text("{}")
-    client = GeoDelClient(
-        "https://example.com",
-        "geodel_secret",
-        "0.1.0",
-        transport=MagicMock(spec=Transport),
-    )
-    client.upload_file = Mock(return_value="upload-1")
-    processing = {
-        "id": "upload-1",
-        "status": "processing",
-        "errorMessage": None,
-    }
-    ready = {"id": "upload-1", "status": "ready", "errorMessage": None}
-    client.get_upload_status = Mock(
-        side_effect=[GeoDelError("temporary"), processing, ready, ready]
-    )
-    client.get_share_token = Mock(
-        side_effect=[GeoDelError("temporary"), "share-1"]
-    )
-    now = [0.0]
-
-    with patch("geodel.client.monotonic", side_effect=lambda: now[0]), patch(
-        "geodel.client.sleep",
-        side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds),
-    ):
-        result = client.publish_file(source, "roads.geojson", "org-1")
-
-    assert result == {"shareToken": "share-1", "timedOut": False}
-    assert client.get_upload_status.call_count == 4
-    assert client.get_share_token.call_count == 2
-
-
-def test_publish_cancels_while_waiting_for_processing(tmp_path):
-    source = tmp_path / "roads.geojson"
-    source.write_text("{}")
-    client = GeoDelClient(
-        "https://example.com",
-        "geodel_secret",
-        "0.1.0",
-        transport=MagicMock(spec=Transport),
-    )
-    client.upload_file = Mock(return_value="upload-1")
-    client.get_upload_status = Mock(
-        return_value={
-            "id": "upload-1",
-            "status": "processing",
-            "errorMessage": None,
-        }
-    )
-
-    with pytest.raises(UploadCanceled, match="Upload canceled"):
-        client.publish_file(
-            source,
-            "roads.geojson",
-            "org-1",
-            is_canceled=Mock(side_effect=[False, True]),
-        )
-
-
-def test_publish_returns_timeout_outcome(tmp_path):
-    source = tmp_path / "roads.geojson"
-    source.write_text("{}")
-    client = GeoDelClient(
-        "https://example.com",
-        "geodel_secret",
-        "0.1.0",
-        transport=MagicMock(spec=Transport),
-    )
-    client.upload_file = Mock(return_value="upload-1")
-    client.get_upload_status = Mock(
-        return_value={
-            "id": "upload-1",
-            "status": "processing",
-            "errorMessage": None,
-        }
-    )
-    now = [0.0]
-
-    client.config = replace(client.config, processing_timeout_seconds=1)
-    with patch(
-        "geodel.client.monotonic", side_effect=lambda: now[0]
-    ), patch(
-        "geodel.client.sleep",
-        side_effect=lambda seconds: now.__setitem__(0, now[0] + seconds),
-    ):
-        result = client.publish_file(source, "roads.geojson", "org-1")
-
-    assert result == {"timedOut": True}
 
 
 def test_rejects_file_over_max_size_before_request(tmp_path):

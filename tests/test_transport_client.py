@@ -97,33 +97,6 @@ def test_multipart_registration_failure_attempts_cleanup(tmp_path):
     assert transport.calls[3][2]["json"] == {"parts": [{"PartNumber": 1, "ETag": '"first"'}]}
 
 
-def test_poll_cancellation_interrupts_status_request(tmp_path):
-    import pytest
-    from geodel.client import UploadCanceled
-    from geodel.transport import Response, TransportCanceled
-
-    class CancelStatus(FixtureTransport):
-        def request(self, method, url, **options):
-            if url.endswith("/status"):
-                assert options["is_canceled"] is canceled
-                raise TransportCanceled("canceled")
-            return super().request(method, url, **options)
-
-    canceled = lambda: False
-    transport = CancelStatus(
-        Response(200, b'{"uploadId":"attempt-1","key":"storage-key"}'),
-        Response(200, b'{"url":"https://storage.example.com/part"}'),
-        Response(200, headers={"ETag": '"first"'}),
-        Response(200, b'{}'),
-        Response(200, b'{"id":"upload-1"}'),
-    )
-    source = tmp_path / "roads.geojson"
-    source.write_bytes(b'{}')
-    client = GeoDelClient("https://example.com", "synthetic-key", "0.1.0", transport)
-    with pytest.raises(UploadCanceled):
-        client.publish_file(source, source.name, "workspace-1", is_canceled=canceled)
-
-
 def test_client_failure_messages_hide_submitted_key():
     import pytest
     from geodel.client import GeoDelError
@@ -171,36 +144,6 @@ def test_invalid_payload_is_distinct_from_network_failure():
         with pytest.raises(GeoDelError) as error:
             client.list_organizations()
         assert not isinstance(error.value, ServerUnavailableError)
-
-
-def test_constructor_cancellation_stops_processing_wait(tmp_path):
-    import pytest
-    from unittest.mock import patch
-    from geodel.client import UploadCanceled
-    from geodel.transport import Response
-
-    canceled = [False]
-    class ProcessingTransport(FixtureTransport):
-        def request(self, method, url, **options):
-            response = super().request(method, url, **options)
-            if url.endswith("/status"):
-                canceled[0] = True
-            return response
-    transport = ProcessingTransport(
-        Response(200, b'{"uploadId":"attempt-1","key":"storage-key"}'),
-        Response(200, b'{"url":"https://storage.example.com/part"}'),
-        Response(200, headers={"ETag": '"first"'}),
-        Response(200, b'{}'),
-        Response(200, b'{"id":"upload-1"}'),
-        Response(200, b'{"id":"upload-1","status":"processing"}'),
-    )
-    source = tmp_path / "roads.geojson"
-    source.write_bytes(b'{}')
-    client = GeoDelClient("https://example.com", "synthetic-key", "0.1.0", transport,
-                          is_canceled=lambda: canceled[0])
-    with patch("geodel.client.sleep", side_effect=AssertionError("Canceled tasks must not wait")):
-        with pytest.raises(UploadCanceled):
-            client.publish_file(source, source.name, "workspace-1")
 
 
 def test_upload_accepts_exactly_200_mib_in_10_mib_parts(tmp_path):

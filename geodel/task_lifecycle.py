@@ -7,7 +7,8 @@ def task_is_active(task):
 
 def cancel_task(task):
     try:
-        if task_is_active(task):
+        # Queued tasks also return False from isActive().
+        if task is not None:
             task.cancel()
     except RuntimeError:
         pass

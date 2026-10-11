@@ -56,6 +56,10 @@ class LayerExport:
     def has_more_layers(self):
         return self._next_layer < len(self.layers)
 
+    def cleanup(self):
+        if self._artifact is not None:
+            self._artifact.cleanup()
+
     def create_task(self, on_finished):
         if self._artifact is None:
             directory = TemporaryDirectory(prefix="geodel-")
@@ -79,8 +83,6 @@ class LayerExport:
             completed = True
             if error is None and result is None and self._error:
                 error = GeoDelError(self._error)
-            if error is not None or result is None:
-                artifact.cleanup()
             on_finished(error, result)
 
         task = QgsTask.fromFunction(

@@ -19,12 +19,11 @@ from .client import (
 from .auth_compat import unpack_auth_result
 from .config import API_URL, DEFAULT_CONFIG, PRODUCT_NAME
 from .dock import GeoDelDockWidget
-from .layer_export import LayerExport
 from .task_lifecycle import cancel_task, disconnect_signal, task_is_active
 from .tasks import (
     _load_organizations, _load_metadata, _load_folders, _load_recent_uploads,
-    _upload_file,
 )
+from .upload import Upload
 
 SETTINGS_PREFIX = "GeoDel"
 METADATA_REFRESH_MILLISECONDS = 5 * 60 * 1000
@@ -50,8 +49,7 @@ class GeoDelPlugin:
         self._organization_timer = None
         self._organization_version = 0
         self._folder_task = None
-        self._upload_task = None
-        self._upload_cancel_requested = False
+        self._upload = None
         self._uploads_task = None
         self._version_task = None
         self._metadata_timer = None
@@ -63,7 +61,6 @@ class GeoDelPlugin:
         self._connection_version = 0
         self._lifecycle_version = 0
         self._signals = []
-        self._upload_progress = None
 
     def initGui(self):  # noqa: N802 - QGIS plugin API
         if self.action is not None:
@@ -136,7 +133,9 @@ class GeoDelPlugin:
         for signal, callback in self._signals:
             disconnect_signal(signal, callback)
         self._signals.clear()
-        self._disconnect_upload_progress()
+        if self._upload is not None:
+            upload, self._upload = self._upload, None
+            upload.close()
         for name in ("_recent_timer", "_organization_timer", "_metadata_timer"):
             timer = getattr(self, name)
             if timer is not None:
@@ -144,7 +143,7 @@ class GeoDelPlugin:
                 timer.deleteLater()
                 setattr(self, name, None)
         for name in (
-            "_organization_task", "_folder_task", "_upload_task",
+            "_organization_task", "_folder_task",
             "_uploads_task", "_version_task",
         ):
             task = getattr(self, name)
@@ -678,7 +677,7 @@ class GeoDelPlugin:
     def _update_upload_enabled(self):
         if (
             self.dock is None
-            or self._upload_task is not None
+            or self._upload is not None
             or self._folder_task is not None
         ):
             return
@@ -724,174 +723,53 @@ class GeoDelPlugin:
             "config": self._config,
         }
 
-    def _new_upload_task(
-        self,
-        path,
-        upload_filename,
-        destination,
-        version,
-        artifact=None,
-    ):
-        task: QgsTask = QgsTask.fromFunction(
-            f"Upload {upload_filename} to {PRODUCT_NAME}",
-            _upload_file,
-            on_finished=lambda error, result=None: self._upload_finished(
-                task, version, destination["server_url"], error, result
-            ),
-            path=str(path) if path else None,
-            upload_filename=upload_filename,
-            artifact=artifact,
-            **destination,
-        )
-        return task
-
-    def _disconnect_upload_progress(self):
-        if self._upload_progress is not None:
-            disconnect_signal(*self._upload_progress)
-            self._upload_progress = None
-
-    def _run_upload_task(self, task, exporting=False):
-        if self.dock is None:
-            cancel_task(task)
-            return
-        self._disconnect_upload_progress()
-        self._upload_task = task
-        self._upload_cancel_requested = False
-        self.dock.set_uploading(True)
-        if exporting:
-            self.dock.upload_button.setText("Preparing layers…")
-
-        def show_progress(value):
-            # Queued signal: may arrive after unload() or after a newer task started.
-            if self.dock is not None and task is self._upload_task:
-                self.dock.progress.setValue(int(value))
-
-        task.progressChanged.connect(show_progress)
-        self._upload_progress = (task.progressChanged, show_progress)
-        QgsApplication.taskManager().addTask(task)
+    def _upload_progress_changed(self, upload, preparing, value):
+        if self.dock is not None and upload is self._upload:
+            self.dock.upload_button.setText("Preparing layers…" if preparing else "Uploading…")
+            self.dock.progress.setValue(int(value))
 
     def _cancel_upload(self):
+        upload = self._upload
         if (
-            self.dock is None or self._upload_task is None
-            or self._upload_cancel_requested
+            self.dock is None or upload is None
+            or not upload.cancel() or upload is not self._upload
         ):
             return
-        self._upload_cancel_requested = True
         self.dock.cancel_upload_button.setEnabled(False)
         self.dock.cancel_upload_button.setText("Canceling…")
         self.dock.status.setText("Canceling upload…")
-        cancel_task(self._upload_task)
 
     def _start_upload(self):
-        if self._upload_task is not None:
+        if self._upload is not None:
             return
         layers = self._selected_layers()
-        if layers:
-            self._start_layer_upload(layers)
-            return
-        if self._selected_path is None:
+        if not layers and self._selected_path is None:
             return
         try:
-            file_size = self._selected_path.stat().st_size
-        except OSError as error:
-            self.iface.messageBar().pushCritical(
-                PRODUCT_NAME, f"Could not read upload file: {error}"
+            upload = Upload(
+                path=self._selected_path, layers=layers, config=self._config,
             )
-            return
-        if file_size > self._config.max_file_size_bytes:
-            self.iface.messageBar().pushCritical(
-                PRODUCT_NAME, f"File exceeds the {self._config.file_size_label} upload limit."
-            )
-            return
-        if file_size == 0:
-            self.iface.messageBar().pushCritical(PRODUCT_NAME, "File is empty.")
-            return
-
-        upload_filename = self._upload_filename(self._selected_path.suffix.lower())
-        if upload_filename is None:
-            return
-        destination = self._upload_destination()
-        if destination is None:
-            return
-        self._run_upload_task(
-            self._new_upload_task(
-                self._selected_path,
-                upload_filename,
-                destination,
-                self._connection_version,
-            )
-        )
-
-    def _start_layer_upload(self, layers):
-        try:
-            export = LayerExport(layers, self._config)
         except GeoDelError as error:
             self.iface.messageBar().pushCritical(PRODUCT_NAME, str(error))
             return
-        upload_filename = self._upload_filename(export.suffix)
+        upload_filename = self._upload_filename(upload.suffix)
         if upload_filename is None:
             return
         destination = self._upload_destination()
         if destination is None:
             return
 
-        self._run_upload_task(
-            self._new_layer_export_task(export, self._connection_version, upload_filename, destination),
-            exporting=True,
+        self._upload = upload
+        self.dock.set_uploading(True)
+        upload.start(
+            upload_filename, destination, self._connection_version,
+            self._upload_progress_changed, self._upload_finished,
         )
 
-    def _new_layer_export_task(self, export, version, upload_filename, destination):
-        task: QgsTask = export.create_task(
-            lambda error, artifact: self._layer_export_finished(
-                task, version, upload_filename, destination, error, artifact, export
-            )
-        )
-        return task
-
-    def _layer_export_finished(
-        self, task, version, upload_filename, destination, error, artifact, export=None
-    ):
-        if task is not self._upload_task:
-            if artifact:
-                artifact.cleanup()
+    def _upload_finished(self, upload, error, result):
+        if upload is not self._upload:
             return
-        if self._upload_cancel_requested:
-            if artifact:
-                artifact.cleanup()
-            self._upload_finished(
-                task, version, destination["server_url"], None, None
-            )
-            return
-        if error is not None:
-            self._upload_finished(
-                task, version, destination["server_url"], error, None
-            )
-            return
-        if artifact is None:
-            self._upload_finished(
-                task, version, destination["server_url"], None, None
-            )
-            return
-        if export is not None and export.has_more_layers:
-            self._run_upload_task(
-                self._new_layer_export_task(export, version, upload_filename, destination),
-                exporting=True,
-            )
-            return
-        self._run_upload_task(
-            self._new_upload_task(
-                None, upload_filename, destination, version, artifact=artifact
-            )
-        )
-
-    def _upload_finished(self, task, version, server_url, error, result):
-        if task is not self._upload_task:
-            return
-        self._disconnect_upload_progress()
-        if self._upload_cancel_requested and result is None:
-            error = None
-        self._upload_task = None
-        self._upload_cancel_requested = False
+        self._upload = None
         if self.dock is None:
             return
         self.dock.set_uploading(False)
@@ -899,7 +777,7 @@ class GeoDelPlugin:
         self._refresh_recent_uploads()
         if error is not None:
             if isinstance(error, AuthenticationError):
-                self._connection_rejected(version)
+                self._connection_rejected(upload.connection_version)
                 return
             reason = (
                 str(error) if isinstance(error, GeoDelError) else "Upload failed."

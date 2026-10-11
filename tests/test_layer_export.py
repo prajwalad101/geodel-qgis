@@ -180,7 +180,8 @@ def test_prepares_zipped_shapefiles_with_safe_unique_names_and_owned_cleanup():
 
 def test_reports_writer_failure_and_cleans_owned_directory():
     completed = []
-    task = LayerExport([Layer("Roads", error="disk full")]).create_task(
+    export = LayerExport([Layer("Roads", error="disk full")])
+    task = export.create_task(
         lambda error, artifact: completed.append((error, artifact))
     )
     directory = task.subtasks[0].path.parent
@@ -191,4 +192,5 @@ def test_reports_writer_failure_and_cleans_owned_directory():
     assert isinstance(error, GeoDelError)
     assert str(error) == 'Could not export layer "Roads": disk full'
     assert artifact is None
+    export.cleanup()
     assert not directory.exists()

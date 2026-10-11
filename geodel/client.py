@@ -7,7 +7,7 @@ from pathlib import Path
 from queue import Empty, Queue
 from secrets import randbelow
 from threading import Event, Lock
-from time import monotonic, sleep
+from time import sleep
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .transport import (
@@ -278,99 +278,6 @@ class GeoDelClient:
         if canceled():
             raise UploadCanceled("Upload canceled")
         return sorted(parts, key=lambda part: part["PartNumber"])
-
-    def publish_file(
-        self,
-        path: Path,
-        filename: str,
-        organization_id: str,
-        folder_id: Optional[str] = None,
-        progress: Optional[Callable[[float], None]] = None,
-        is_canceled: Optional[Callable[[], bool]] = None,
-    ) -> Dict[str, Any]:
-        is_canceled = is_canceled or self.is_canceled
-        upload_id = self.upload_file(
-            path,
-            filename,
-            organization_id,
-            folder_id,
-            (lambda value: progress(value * 0.9)) if progress else None,
-            is_canceled,
-        )
-        started = monotonic()
-        delay = 3.0
-        status_errors = 0
-        share_token_errors = 0
-        while monotonic() - started < self.config.processing_timeout_seconds:
-            if is_canceled and is_canceled():
-                raise UploadCanceled("Upload canceled")
-            try:
-                status = self.get_upload_status(upload_id, organization_id, is_canceled)
-            except (AuthenticationError, AuthorizationError, UploadCanceled):
-                raise
-            except GeoDelError:
-                status_errors += 1
-                if status_errors >= 3:
-                    raise
-                status = None
-            if status is not None:
-                status_errors = 0
-                if status["status"] == "failed":
-                    raise GeoDelError(
-                        status.get("errorMessage") or "Upload processing failed"
-                    )
-                if status["status"] == "ready":
-                    try:
-                        share_token = self.get_share_token(upload_id, organization_id, is_canceled)
-                    except (AuthenticationError, AuthorizationError, UploadCanceled):
-                        raise
-                    except GeoDelError:
-                        share_token_errors += 1
-                        if share_token_errors >= 3:
-                            raise
-                    else:
-                        if progress:
-                            progress(100)
-                        return {"shareToken": share_token, "timedOut": False}
-
-            elapsed = monotonic() - started
-            if progress:
-                progress(min(99, 90 + elapsed / self.config.processing_timeout_seconds * 9))
-            wait_until = monotonic() + delay
-            while monotonic() < wait_until:
-                if is_canceled and is_canceled():
-                    raise UploadCanceled("Upload canceled")
-                remaining = wait_until - monotonic()
-                if remaining <= 0:
-                    break
-                sleep(min(0.25, remaining))
-            delay = min(delay * 1.5, 15)
-
-        return {"timedOut": True}
-
-    def get_upload_status(
-        self, upload_id: str, organization_id: str,
-        is_canceled: Optional[Callable[[], bool]] = None,
-    ) -> Dict[str, Any]:
-        payload = self._get(f"/uploads/{upload_id}/status", organization_id, is_canceled=is_canceled)
-        if (
-            payload.get("id") != upload_id
-            or payload.get("status") not in ("pending", "processing", "ready", "failed")
-            or payload.get("errorMessage") is not None
-            and not isinstance(payload.get("errorMessage"), str)
-        ):
-            raise GeoDelError(f"{PRODUCT_NAME} returned an invalid upload status")
-        return payload
-
-    def get_share_token(
-        self, upload_id: str, organization_id: str,
-        is_canceled: Optional[Callable[[], bool]] = None,
-    ) -> str:
-        payload = self._get(f"/uploads/{upload_id}/detail", organization_id, is_canceled=is_canceled)
-        token = payload.get("shareToken")
-        if not isinstance(token, str):
-            raise GeoDelError(f"{PRODUCT_NAME} returned an invalid share link")
-        return token
 
     def _get(
         self,

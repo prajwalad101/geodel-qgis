@@ -321,28 +321,6 @@ def test_delayed_auth_failure_does_not_remove_replacement_key():
     assert manager.removed == ["replacement-config"]
 
 
-def test_layer_export_keeps_original_connection_version():
-    versions = []
-    task = object()
-
-    class Plugin:
-        _upload_task = task
-        _upload_cancel_requested = False
-
-        def _new_upload_task(self, _path, _name, _destination, version, **_kwargs):
-            versions.append(version)
-
-        def _run_upload_task(self, _task):
-            pass
-
-    subject = Plugin()
-    export_finished = _plugin_method("GeoDelPlugin", "_layer_export_finished")
-
-    export_finished(subject, task, 0, "roads.geojson", {}, None, object())
-
-    assert versions == [0]
-
-
 def test_folder_selector_uses_top_level_names_and_restores_selection():
     class Combo:
         def clear(self):
