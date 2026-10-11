@@ -17,7 +17,8 @@ def _load_organizations(task, server_url, api_key, config=DEFAULT_CONFIG):
     if task.isCanceled():
         return None
     organizations = _client(task, server_url, api_key, config).list_organizations()
-    return None if task.isCanceled() else organizations
+    # QGIS omits falsy task results; keep an empty Workspace list distinct from cancellation.
+    return None if task.isCanceled() else (organizations,)
 
 
 def _load_metadata(task, server_url, config=DEFAULT_CONFIG):
@@ -62,15 +63,13 @@ def _upload_file(
     folder_id,
     path,
     upload_filename,
-    artifact=None,
     config=DEFAULT_CONFIG,
 ):
-    path = artifact.path if artifact else Path(path)
     client = _client(task, server_url, api_key, config)
     try:
         # Stop once bytes are sent; Recent uploads polls processing -> ready.
         return client.upload_file(
-            path,
+            Path(path),
             upload_filename,
             organization_id,
             folder_id,
@@ -79,6 +78,3 @@ def _upload_file(
         )
     except UploadCanceled:
         return None
-    finally:
-        if artifact:
-            artifact.cleanup()

@@ -18,7 +18,7 @@ sys.path.insert(0, os.environ.get(
     "GEODEL_PACKAGE_ROOT", str(Path(__file__).resolve().parents[2]),
 ))
 
-from qgis.PyQt.QtCore import QCoreApplication, QEvent, QT_VERSION_STR, QTimer
+from qgis.PyQt.QtCore import QCoreApplication, QEvent, QThread, QT_VERSION_STR, QTimer
 from qgis.PyQt.QtWidgets import (
     QApplication, QDockWidget, QMainWindow, QMenu, QToolBar, QToolButton,
 )
@@ -99,7 +99,7 @@ class PluginRuntimeTests(unittest.TestCase):
         self.version = self.patches.enter_context(patch.object(
             GeoDelClient, "requires_update", return_value=False,
         ))
-        self.patches.enter_context(patch.object(
+        self.organizations = self.patches.enter_context(patch.object(
             GeoDelClient, "list_organizations",
             return_value=[{"id": "org-1", "name": "Test Workspace"}],
         ))
@@ -139,6 +139,14 @@ class PluginRuntimeTests(unittest.TestCase):
         self.assertTrue(loaded)
         return config.config("password")
 
+    def prepare_connection(self):
+        self.assertTrue(QgsApplication.authManager().setMasterPassword("synthetic-runtime-master-password", True))
+        self.plugin.initGui()
+        self.plugin.action.trigger()
+        self.connect_key("synthetic-key")
+        wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+        return self.plugin.settings.value("GeoDel/authConfigId", "", type=str)
+
     def test_metadata_updates_limits_hints_accessibility_and_timers(self):
         from geodel.config import PluginConfig
         from geodel.plugin import METADATA_REFRESH_MILLISECONDS
@@ -155,7 +163,7 @@ class PluginRuntimeTests(unittest.TestCase):
         self.assertEqual(zone.types.text(), ".json — up to 300 MiB")
         self.assertEqual(zone.accessibleDescription(), zone.types.text())
         self.assertEqual(self.plugin._recent_timer.interval(), 12_000)
-        self.assertEqual(self.plugin._organization_timer.interval(), 9_000)
+        self.assertEqual(self.plugin.dock.findChild(QTimer, "GeoDelConnectionTimer").interval(), 9_000)
         self.assertEqual(self.plugin._metadata_timer.interval(), METADATA_REFRESH_MILLISECONDS)
         self.assertFalse(self.plugin._metadata_timer.isActive())
         self.plugin.action.trigger()
@@ -220,15 +228,16 @@ class PluginRuntimeTests(unittest.TestCase):
         self.assertIsNone(self.plugin._upload_filename(".geojson"))
 
     def test_existing_selected_file_is_rechecked_after_policy_changes(self):
+        from geodel.client import GeoDelClient
         from geodel.config import DEFAULT_CONFIG
 
         self.prepare_file_upload()
         self.plugin._config = replace(DEFAULT_CONFIG, max_file_size_bytes=1)
-        with patch.object(self.plugin, "_new_upload_task") as upload:
+        with patch.object(GeoDelClient, "upload_file") as upload:
             self.plugin._start_upload()
             upload.assert_not_called()
         self.plugin._config = replace(DEFAULT_CONFIG, allowed_extensions=(".zip",))
-        with patch.object(self.plugin, "_new_upload_task") as upload:
+        with patch.object(GeoDelClient, "upload_file") as upload:
             self.plugin._start_upload()
             upload.assert_not_called()
 
@@ -239,22 +248,20 @@ class PluginRuntimeTests(unittest.TestCase):
         self.prepare_file_upload()
         original = replace(DEFAULT_CONFIG, max_file_size_bytes=300 * 1024**2)
         self.plugin._config = original
-        destination = self.plugin._upload_destination()
-        self.plugin._config = replace(DEFAULT_CONFIG, max_file_size_bytes=100 * 1024**2)
-        task = self.plugin._new_upload_task(self.plugin._selected_path, "roads.geojson", destination,
-                                            self.plugin._connection_version)
         observed = []
         def upload(client, *_args):
             observed.append(client.config)
             return "upload-1"
         with patch.object(GeoDelClient, "upload_file", upload):
-            self.plugin._run_upload_task(task)
-            wait_until(lambda: self.plugin._upload_task is None)
+            self.plugin.dock.upload_button.click()
+            self.plugin._config = replace(DEFAULT_CONFIG, max_file_size_bytes=100 * 1024**2)
+            wait_until(lambda: self.plugin._upload is None)
         self.assertEqual(observed, [original])
 
     def test_layer_export_handoff_keeps_starting_config(self):
         from geodel.client import GeoDelClient
         from geodel.config import DEFAULT_CONFIG
+        from geodel.layer_export import LayerExport
         from qgis.core import QgsFeature, QgsGeometry, QgsVectorLayer
 
         self.prepare_file_upload()
@@ -265,12 +272,13 @@ class PluginRuntimeTests(unittest.TestCase):
             self.assertGreater(path.stat().st_size, 1)
             observed.append(client.config)
             return "upload-1"
-        original_task = self.plugin._new_layer_export_task
-        def prepare(export, version, filename, destination):
+        original_task = LayerExport.create_task
+        def prepare(export, on_finished):
+            self.assertEqual(QThread.currentThread(), self.iface.window.thread())
             self.plugin._config = replace(DEFAULT_CONFIG, max_file_size_bytes=1, allowed_extensions=())
-            return original_task(export, version, filename, destination)
+            return original_task(export, on_finished)
         with patch.object(GeoDelClient, "upload_file", upload), \
-                patch.object(self.plugin, "_new_layer_export_task", side_effect=prepare):
+                patch.object(LayerExport, "create_task", prepare):
             for count in (1, 2):
                 original = replace(DEFAULT_CONFIG, max_project_layers=count)
                 self.plugin._config = original
@@ -285,8 +293,39 @@ class PluginRuntimeTests(unittest.TestCase):
                 for index in range(self.plugin.dock.layers.count()):
                     self.plugin.dock.layers.item(index).setSelected(True)
                 self.plugin.dock.upload_button.click()
-                wait_until(lambda: self.plugin._upload_task is None)
+                wait_until(lambda: self.plugin._upload is None)
                 self.assertIs(observed[-1], original)
+
+    def test_layer_upload_keeps_destination_and_cannot_reject_replacement_connection(self):
+        from geodel.client import AuthenticationError, GeoDelClient
+        from geodel.layer_export import LayerExport
+
+        config_id = self.prepare_connection()
+        self.select_project_layers(2)
+        self.plugin.dock.set_folders([{"id": "original", "name": "Original"}], "original")
+        artifacts, destinations = [], []
+        original_task = LayerExport.create_task
+        def prepare(export, on_finished):
+            if self.read_stored_key(config_id) == "synthetic-key":
+                self.plugin.dock.replace_button.click()
+                self.connect_key("synthetic-replacement-key")
+                wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+            self.plugin.dock.set_folders([{"id": "replacement", "name": "Replacement"}], "replacement")
+            return original_task(export, on_finished)
+        def upload(client, path, _name, organization, folder, *_args):
+            artifacts.append(path)
+            destinations.append((client.api_key, organization, folder))
+            raise AuthenticationError("Old key rejected")
+        with patch.object(LayerExport, "create_task", prepare), \
+                patch.object(GeoDelClient, "upload_file", upload):
+            self.plugin.dock.upload_button.click()
+            wait_until(lambda: self.plugin._upload is None)
+        self.assertEqual(destinations, [("synthetic-key", "org-1", "original")])
+        self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId"), config_id)
+        self.assertEqual(self.read_stored_key(config_id), "synthetic-replacement-key")
+        self.assertIs(self.plugin.dock.screens.currentWidget(), self.plugin.dock.main_panel)
+        self.assertEqual(len(self.plugin.dock.layers.selectedItems()), 2)
+        self.assertFalse(artifacts[0].parent.exists())
 
     def test_entry_point_open_close_unload_and_reload(self):
         for _ in range(2):
@@ -360,6 +399,262 @@ class PluginRuntimeTests(unittest.TestCase):
                 self.assertNotIn(b"synthetic-replacement-key", path.read_bytes())
         self.assertTrue(manager.removeAuthenticationConfig(config_id))
 
+    def test_connecting_feedback_precedes_verification_and_trims_candidate_key(self):
+        from geodel.client import GeoDelClient
+
+        self.assertTrue(QgsApplication.authManager().setMasterPassword("synthetic-runtime-master-password", True))
+        self.plugin.initGui()
+        self.plugin.action.trigger()
+        started, release = Event(), Event()
+        self.addCleanup(release.set)
+        observed = []
+        def verify(client):
+            observed.append(client.api_key)
+            started.set()
+            release.wait(5)
+            return [{"id": "org-1", "name": "Test Workspace"}]
+        with patch.object(GeoDelClient, "list_organizations", verify):
+            dock = self.plugin.dock
+            dock.api_key.setText("  synthetic-first-key  ")
+            dock.connect_button.click()
+            self.assertEqual(dock.setup_status.text(), "Checking this Personal API Key…")
+            self.assertFalse(dock.api_key.isEnabled())
+            self.assertFalse(dock.connect_button.isEnabled())
+            wait_until(started.is_set)
+            release.set()
+            wait_until(lambda: dock.screens.currentWidget() is dock.main_panel)
+        self.assertEqual(observed, ["synthetic-first-key"])
+        config_id = self.plugin.settings.value("GeoDel/authConfigId", "", type=str)
+        self.assertEqual(self.read_stored_key(config_id), "synthetic-first-key")
+
+    def test_rejected_replacement_keeps_saved_key_and_returns_to_uploads(self):
+        from geodel.client import AuthenticationError
+        from geodel.connection import NEW_KEY_REJECTED_MESSAGE
+
+        config_id = self.prepare_connection()
+        dock = self.plugin.dock
+        dock.replace_button.click()
+        self.organizations.side_effect = AuthenticationError("Synthetic rejected key")
+        dock.api_key.setText("synthetic-rejected-key")
+        dock.connect_button.click()
+        wait_until(lambda: dock.setup_status.text() == NEW_KEY_REJECTED_MESSAGE)
+        self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId"), config_id)
+        self.assertEqual(self.read_stored_key(config_id), "synthetic-key")
+        self.assertEqual(dock.organizations.currentData(), "org-1")
+        self.assertFalse(dock.cancel_replacement_button.isHidden())
+        self.assertTrue(dock.connect_button.isEnabled())
+        dock.cancel_replacement_button.click()
+        self.assertIs(dock.screens.currentWidget(), dock.main_panel)
+        self.assertEqual(dock.api_key.text(), "")
+
+    def test_connection_management_refresh_keeps_management_until_return(self):
+        config_id = self.prepare_connection()
+        dock = self.plugin.dock
+        dock.replace_button.click()
+        self.assertEqual(dock.setup_title.text(), "Connection management")
+        # Workflow state survives a rendering change without reading the widget.
+        dock.screens.setCurrentWidget(dock.main_panel)
+        dock.refresh_requested.emit()
+        wait_until(lambda: dock.setup_status.text() == "Connection verified.")
+        self.assertIs(dock.screens.currentWidget(), dock.setup_panel)
+        self.assertFalse(dock.cancel_replacement_button.isHidden())
+        self.assertEqual(self.read_stored_key(config_id), "synthetic-key")
+        dock.cancel_replacement_button.click()
+        self.assertIs(dock.screens.currentWidget(), dock.main_panel)
+
+    def test_failed_or_canceled_saved_checks_preserve_connection_and_view(self):
+        from geodel.client import GeoDelError, ServerUnavailableError
+        from geodel.connection import CONNECTION_FAILED_MESSAGE, SERVER_UNAVAILABLE_MESSAGE
+
+        config_id = self.prepare_connection()
+        dock = self.plugin.dock
+        outcomes = (
+            (ServerUnavailableError("Synthetic unavailable"), SERVER_UNAVAILABLE_MESSAGE),
+            (GeoDelError("Synthetic failure"), CONNECTION_FAILED_MESSAGE),
+            (None, "Connection check was canceled. Try again."),
+        )
+        for managing in (False, True):
+            if managing:
+                dock.replace_button.click()
+            for error, message in outcomes:
+                with self.subTest(managing=managing, error=type(error).__name__):
+                    self.organizations.side_effect = error
+                    self.organizations.return_value = None
+                    dock.refresh_requested.emit()
+                    status = dock.setup_status if managing else dock.status
+                    wait_until(lambda: message in status.text())
+                    self.assertIs(dock.screens.currentWidget(), dock.setup_panel if managing else dock.main_panel)
+                    self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId"), config_id)
+                    self.assertEqual(self.read_stored_key(config_id), "synthetic-key")
+                    self.assertTrue(dock.refresh_button.isEnabled())
+                    if managing:
+                        self.assertFalse(dock.cancel_replacement_button.isHidden())
+
+    def test_saved_key_rejection_removes_encrypted_config_and_requires_reconnection(self):
+        from geodel.auth_compat import unpack_auth_result
+        from geodel.client import AuthenticationError
+        from geodel.connection import SAVED_KEY_REJECTED_MESSAGE
+
+        config_id = self.prepare_connection()
+        self.organizations.side_effect = AuthenticationError("Synthetic expired key")
+        self.plugin.dock.refresh_requested.emit()
+        wait_until(lambda: self.plugin.dock.setup_status.text() == SAVED_KEY_REJECTED_MESSAGE)
+        self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId", ""), "")
+        config = QgsAuthMethodConfig()
+        loaded, _config = unpack_auth_result(
+            QgsApplication.authManager().loadAuthenticationConfig(config_id, config, True), config,
+        )
+        self.assertFalse(loaded)
+        self.assertEqual(self.plugin.dock.organizations.count(), 0)
+        self.assertTrue(self.plugin.dock.cancel_replacement_button.isHidden())
+
+    def test_secure_storage_failure_keeps_candidate_and_existing_connection(self):
+        manager = QgsApplication.authManager()
+        self.assertTrue(manager.setMasterPassword("synthetic-runtime-master-password", True))
+        self.plugin.initGui()
+        self.plugin.action.trigger()
+        for replacing in (False, True):
+            with self.subTest(replacing=replacing):
+                config_id = ""
+                if replacing:
+                    self.connect_key("synthetic-key")
+                    wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+                    config_id = self.plugin.settings.value("GeoDel/authConfigId", "", type=str)
+                    self.plugin.dock.replace_button.click()
+                dock = self.plugin.dock
+                dock.api_key.setText("synthetic-unsaved-key")
+                with patch.object(manager, "storeAuthenticationConfig", return_value=False), \
+                        patch("geodel.connection.QMessageBox.warning") as warning:
+                    dock.connect_button.click()
+                    wait_until(lambda: "could not save it securely" in dock.setup_status.text())
+                    warning.assert_called_once()
+                self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId", ""), config_id)
+                self.assertEqual(dock.api_key.text(), "synthetic-unsaved-key")
+                self.assertTrue(dock.connect_button.isEnabled())
+                self.assertEqual(dock.cancel_replacement_button.isHidden(), not replacing)
+                if replacing:
+                    self.assertEqual(self.read_stored_key(config_id), "synthetic-key")
+
+    def test_declining_authentication_unlock_does_not_store_verified_key(self):
+        self.plugin.initGui()
+        self.plugin.action.trigger()
+        manager = QgsApplication.authManager()
+        dock = self.plugin.dock
+        dock.api_key.setText("synthetic-unsaved-key")
+        with patch.object(manager, "masterPasswordIsSet", return_value=False), \
+                patch.object(manager, "masterPasswordHashInDatabase", return_value=False), \
+                patch.object(manager, "setMasterPassword", return_value=False) as unlock, \
+                patch("geodel.connection.QMessageBox.information") as explanation:
+            dock.connect_button.click()
+            wait_until(lambda: "could not save it securely" in dock.setup_status.text())
+            unlock.assert_called_once_with(True)
+            explanation.assert_called_once()
+        self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId", ""), "")
+        self.assertTrue(self.plugin.settings.value("GeoDel/masterPasswordExplained", False, type=bool))
+        self.assertEqual(dock.api_key.text(), "synthetic-unsaved-key")
+
+    def test_queued_connection_check_times_out_without_running_or_storing_key(self):
+        from geodel.config import DEFAULT_CONFIG
+        from geodel.connection import SERVER_UNAVAILABLE_MESSAGE
+        from qgis.core import QgsTask
+
+        self.plugin.initGui()
+        self.plugin.action.trigger()
+        wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+        self.plugin._connection.set_config(replace(DEFAULT_CONFIG, connection_feedback_timeout_seconds=1))
+        original_task = QgsTask.fromFunction
+        def queued_task(description, *args, **kwargs):
+            task = original_task(description, *args, **kwargs)
+            if description == "Load GeoDel workspaces":
+                task.hold()
+            return task
+        with patch.object(QgsTask, "fromFunction", side_effect=queued_task):
+            self.plugin.dock.api_key.setText("synthetic-queued-key")
+            self.plugin.dock.connect_button.click()
+            wait_until(lambda: self.plugin.dock.setup_status.text() == SERVER_UNAVAILABLE_MESSAGE)
+            wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+        self.organizations.assert_not_called()
+        self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId", ""), "")
+        self.assertTrue(self.plugin.dock.connect_button.isEnabled())
+        self.assertFalse(self.plugin.dock.findChild(QTimer, "GeoDelConnectionTimer").isActive())
+
+    def test_return_cancels_replacement_and_ignores_completion_in_new_management_view(self):
+        config_id = self.prepare_connection()
+        dock = self.plugin.dock
+        started, release = Event(), Event()
+        self.addCleanup(release.set)
+        def verify():
+            started.set()
+            release.wait(5)
+            return [{"id": "org-other", "name": "Other Workspace"}]
+        self.organizations.side_effect = verify
+        dock.replace_button.click()
+        dock.api_key.setText("synthetic-canceled-key")
+        dock.connect_button.click()
+        wait_until(started.is_set)
+        dock.cancel_replacement_button.click()
+        self.assertIs(dock.screens.currentWidget(), dock.main_panel)
+        self.assertFalse(dock.findChild(QTimer, "GeoDelConnectionTimer").isActive())
+        dock.replace_button.click()
+        dock.api_key.setText("synthetic-unsubmitted-key")
+        release.set()
+        wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+        self.assertIs(dock.screens.currentWidget(), dock.setup_panel)
+        self.assertEqual(dock.api_key.text(), "synthetic-unsubmitted-key")
+        self.assertEqual(dock.organizations.currentData(), "org-1")
+        self.assertEqual(self.read_stored_key(config_id), "synthetic-key")
+
+    def test_unload_connection_check_ignores_late_completion_after_reload(self):
+        self.plugin.initGui()
+        self.plugin.action.trigger()
+        started, release = Event(), Event()
+        self.addCleanup(release.set)
+        def verify():
+            started.set()
+            release.wait(5)
+            return [{"id": "org-1", "name": "Test Workspace"}]
+        self.organizations.side_effect = verify
+        self.plugin.dock.api_key.setText("synthetic-canceled-key")
+        self.plugin.dock.connect_button.click()
+        wait_until(started.is_set)
+        self.plugin.unload()
+        flush_deletes()
+        self.plugin.initGui()
+        self.plugin.dock.api_key.setText("synthetic-unsubmitted-key")
+        release.set()
+        wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+        self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId", ""), "")
+        self.assertEqual(self.plugin.dock.api_key.text(), "synthetic-unsubmitted-key")
+        self.assertIs(self.plugin.dock.screens.currentWidget(), self.plugin.dock.setup_panel)
+        self.assertTrue(self.plugin.dock.connect_button.isEnabled())
+
+    def test_replacement_without_workspaces_clears_old_workspace_data(self):
+        from geodel.recent_upload import RecentUpload
+
+        config_id = self.prepare_connection()
+        dock = self.plugin.dock
+        dock.set_recent_uploads([RecentUpload(
+            "roads.geojson", "Ready", False, None, None, None,
+            "https://example.invalid/s/synthetic-token", None, None,
+        )])
+        self.organizations.return_value = []
+        dock.replace_button.click()
+        dock.api_key.setText("synthetic-no-workspaces-key")
+        dock.connect_button.click()
+        wait_until(lambda: dock.setup_title.text() == "Workspace setup required")
+        self.assertEqual(self.read_stored_key(config_id), "synthetic-no-workspaces-key")
+        self.assertEqual(dock.organizations.count(), 0)
+        self.assertEqual(dock.recent_uploads.count(), 0)
+        self.assertFalse(dock.upload_button.isEnabled())
+        self.assertFalse(dock.retry_connection_button.isHidden())
+        self.assertTrue(dock.retry_connection_button.isEnabled())
+        self.plugin.unload()
+        flush_deletes()
+        self.plugin.initGui()
+        self.plugin.action.trigger()
+        wait_until(lambda: self.plugin.dock.setup_title.text() == "Workspace setup required")
+        self.assertEqual(self.read_stored_key(config_id), "synthetic-no-workspaces-key")
+
     def test_unload_cancels_active_task_and_ignores_late_completion_after_reload(self):
         started, release = Event(), Event()
 
@@ -389,20 +684,29 @@ class PluginRuntimeTests(unittest.TestCase):
         self.assertEqual(len(self.iface.toolbar.actions()), 1)
 
     def prepare_file_upload(self):
-        self.plugin.initGui()
-        self.plugin.action.trigger()
-        self.patches.enter_context(patch.object(
-            self.plugin, "_load_api_key", return_value="synthetic-key",
-        ))
-        self.plugin.dock.set_organizations([{"id": "org-1", "name": "Test Workspace"}])
-        self.plugin.dock.show_connected()
-        wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+        self.prepare_connection()
         source = Path(os.environ["GEODEL_RUNTIME_ROOT"]) / "roads.geojson"
         source.write_text('{"type":"FeatureCollection","features":[]}')
         self.plugin._choose_file(str(source))
         self.assertTrue(self.plugin.dock.upload_button.isEnabled())
         self.assertTrue(self.plugin.dock.cancel_upload_button.isHidden())
         return source
+
+    def select_project_layers(self, count=1):
+        from qgis.core import QgsFeature, QgsGeometry, QgsVectorLayer
+
+        project = QgsProject.instance()
+        project.clear()
+        self.addCleanup(project.clear)
+        for number in range(count):
+            layer = QgsVectorLayer("Point?crs=EPSG:4326", f"roads-{number}", "memory")
+            feature = QgsFeature(layer.fields())
+            feature.setGeometry(QgsGeometry.fromWkt("POINT (1 2)"))
+            layer.dataProvider().addFeatures([feature])
+            layer.updateExtents()
+            project.addMapLayer(layer)
+        for index in range(self.plugin.dock.layers.count()):
+            self.plugin.dock.layers.item(index).setSelected(True)
 
     def test_cancel_transfer_keeps_source_and_name_and_allows_retry(self):
         from geodel.client import GeoDelClient, UploadCanceled
@@ -424,14 +728,14 @@ class PluginRuntimeTests(unittest.TestCase):
             self.assertFalse(dock.cancel_upload_button.isHidden())
             self.assertTrue(dock.cancel_upload_button.isEnabled())
             self.assertFalse(dock.upload_button.isEnabled())
-            task = self.plugin._upload_task
+            task = self.plugin._upload._task
             dock.cancel_upload_button.click()
             self.assertTrue(task.isCanceled())
             self.assertFalse(dock.cancel_upload_button.isEnabled())
             self.assertEqual(dock.status.text(), "Canceling upload…")
             dock.cancel_upload_button.click()
             release.set()
-            wait_until(lambda: self.plugin._upload_task is None)
+            wait_until(lambda: self.plugin._upload is None)
             self.assertEqual(dock.status.text(), "Upload canceled.")
             self.assertEqual(self.plugin._selected_path, source)
             self.assertEqual(dock.upload_name.text(), "roads")
@@ -441,7 +745,7 @@ class PluginRuntimeTests(unittest.TestCase):
             upload.side_effect = None
             upload.return_value = "upload-2"
             dock.upload_button.click()
-            wait_until(lambda: self.plugin._upload_task is None)
+            wait_until(lambda: self.plugin._upload is None)
             self.assertEqual(upload.call_count, 2)
             self.assertIn("Uploaded.", dock.status.text())
             self.assertIsNone(self.plugin._selected_path)
@@ -480,7 +784,7 @@ class PluginRuntimeTests(unittest.TestCase):
                     dock.upload_button.click()
                     self.assertEqual(dock.upload_button.text(), "Preparing layers…")
                     dock.cancel_upload_button.click()
-                    wait_until(lambda: self.plugin._upload_task is None)
+                    wait_until(lambda: self.plugin._upload is None)
                     wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
                     upload.assert_not_called()
                     self.assertEqual(dock.status.text(), "Upload canceled.")
@@ -557,78 +861,198 @@ class PluginRuntimeTests(unittest.TestCase):
                     dock.upload_button.click()
                     self.assertLess(time.monotonic() - started, 1, "Upload click must not block the GUI")
                     self.assertTrue(dock.cancel_upload_button.isEnabled())
-                    wait_until(lambda: self.plugin._upload_task is None)
+                    wait_until(lambda: self.plugin._upload is None)
                     self.assertIn("Uploaded.", dock.status.text())
                     self.assertFalse(artifacts[-1].parent.exists())
             self.assertEqual(upload.call_count, 2)
 
     def test_cancel_export_handoff_does_not_upload_completed_artifact(self):
-        from tempfile import TemporaryDirectory
-        from types import SimpleNamespace
-        from unittest.mock import Mock
+        from geodel.client import GeoDelClient
+        from geodel.layer_export import LayerExport, UploadArtifact
+
+        prepared, release = Event(), Event()
+        self.addCleanup(release.set)
+        artifacts = []
+        original_prepare = LayerExport._prepare
+        def prepare(export, task, **options):
+            artifact = original_prepare(export, task, **options)
+            artifacts.append(artifact)
+            prepared.set()
+            release.wait(5)
+            return artifact
+
+        self.prepare_file_upload()
+        self.select_project_layers()
+        with patch.object(LayerExport, "_prepare", prepare), \
+                patch.object(GeoDelClient, "upload_file") as upload, \
+                patch.object(UploadArtifact, "cleanup", autospec=True, side_effect=UploadArtifact.cleanup) as cleanup:
+            self.plugin.dock.upload_button.click()
+            wait_until(prepared.is_set)
+            self.plugin.dock.cancel_upload_button.click()
+            release.set()
+            wait_until(lambda: self.plugin._upload is None)
+            upload.assert_not_called()
+            cleanup.assert_called_once_with(artifacts[0])
+        self.assertFalse(artifacts[0].path.parent.exists())
+        self.assertEqual(self.plugin.dock.status.text(), "Upload canceled.")
+
+    def test_cancel_or_unload_queued_transfer_cleans_export_without_running_worker(self):
         from geodel.client import GeoDelClient
         from qgis.core import QgsTask
 
+        original_task = QgsTask.fromFunction
+        held = []
+        def create_task(description, *args, **kwargs):
+            task = original_task(description, *args, **kwargs)
+            if description.startswith("Upload "):
+                task.hold()
+                held.append(task)
+            return task
+        for unload in (False, True):
+            with self.subTest(unload=unload), \
+                    patch.object(QgsTask, "fromFunction", side_effect=create_task), \
+                    patch.object(GeoDelClient, "upload_file") as upload:
+                held.clear()
+                self.prepare_file_upload()
+                self.select_project_layers()
+                dock = self.plugin.dock
+                dock.upload_button.click()
+                wait_until(lambda: bool(held))
+                directory = held[0].kwargs["path"].parent
+                self.assertTrue(directory.exists())
+                if unload:
+                    self.plugin.unload()
+                    self.plugin.initGui()
+                else:
+                    dock.cancel_upload_button.click()
+                wait_until(lambda: not directory.exists())
+                wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+                upload.assert_not_called()
+                self.assertIsNone(self.plugin._upload)
+                if not unload:
+                    self.assertEqual(dock.status.text(), "Upload canceled.")
+                    self.assertEqual(len(dock.layers.selectedItems()), 1)
+
+    def test_unload_preparation_retains_files_until_writer_stops_and_does_not_advance(self):
+        from geodel.client import GeoDelClient
+        from geodel.layer_export import LayerExport
+
+        prepared, release = Event(), Event()
+        self.addCleanup(release.set)
+        artifacts = []
+        original_prepare = LayerExport._prepare
+        def prepare(export, task, **options):
+            artifact = original_prepare(export, task, **options)
+            artifacts.append(artifact)
+            prepared.set()
+            release.wait(5)
+            return artifact
         self.prepare_file_upload()
-        directory = TemporaryDirectory(dir=os.environ["GEODEL_RUNTIME_ROOT"])
-        self.addCleanup(directory.cleanup)
-        artifact = SimpleNamespace(path=Path(directory.name) / "export.geojson", cleanup=Mock(wraps=directory.cleanup))
-        artifact.path.write_text("{}")
-        task = QgsTask.fromFunction("Completed export", lambda _task: None)
-        self.plugin._upload_task = task
-        self.plugin.dock.set_uploading(True)
-        self.plugin.dock.cancel_upload_button.click()
-        with patch.object(GeoDelClient, "upload_file") as upload:
-            self.plugin._layer_export_finished(
-                task, self.plugin._connection_version, "export.geojson",
-                {"server_url": "https://example.com"}, None, artifact,
-            )
+        self.select_project_layers(2)
+        with patch.object(LayerExport, "_prepare", prepare), \
+                patch.object(LayerExport, "create_task", autospec=True, side_effect=LayerExport.create_task) as writers, \
+                patch.object(GeoDelClient, "upload_file") as upload:
+            self.plugin.dock.upload_button.click()
+            wait_until(prepared.is_set)
+            directory = artifacts[0].path.parent
+            self.plugin.unload()
+            self.assertTrue(directory.exists())
+            self.plugin.initGui()
+            self.plugin.dock.upload_name.setText("New upload")
+            release.set()
+            wait_until(lambda: not directory.exists())
+            wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+            writers.assert_called_once()
             upload.assert_not_called()
-        artifact.cleanup.assert_called_once()
-        self.assertFalse(artifact.path.exists())
-        self.assertIsNone(self.plugin._upload_task)
-        self.assertEqual(self.plugin.dock.status.text(), "Upload canceled.")
+        self.assertEqual(self.plugin.dock.upload_name.text(), "New upload")
+        self.assertIsNone(self.plugin._upload)
+
+    def test_layer_preparation_and_transfer_failures_clean_files_and_allow_retry(self):
+        from tempfile import TemporaryDirectory
+        from geodel.client import GeoDelClient, GeoDelError
+
+        self.prepare_file_upload()
+        directories = []
+        def temporary_export(**options):
+            directory = TemporaryDirectory(dir=os.environ["GEODEL_RUNTIME_ROOT"], **options)
+            directories.append(Path(directory.name))
+            return directory
+        for empty in (False, True):
+            for count in (1, 2):
+                with self.subTest(empty=empty, layers=count), \
+                        patch("geodel.layer_export.TemporaryDirectory", side_effect=temporary_export), \
+                        patch.object(GeoDelClient, "upload_file", side_effect=GeoDelError("Upload rejected")) as upload:
+                    self.select_project_layers(count)
+                    if empty:
+                        for layer in QgsProject.instance().mapLayers().values():
+                            layer.dataProvider().deleteFeatures([feature.id() for feature in layer.getFeatures()])
+                    dock = self.plugin.dock
+                    name = dock.upload_name.text()
+                    dock.upload_button.click()
+                    wait_until(lambda: self.plugin._upload is None)
+                    if empty:
+                        upload.assert_not_called()
+                        self.assertIn("is empty.", dock.status.text())
+                    else:
+                        upload.assert_called_once()
+                        self.assertEqual(dock.status.text(), "Upload rejected")
+                    self.assertEqual(dock.upload_name.text(), name)
+                    self.assertEqual(len(dock.layers.selectedItems()), count)
+                    self.assertTrue(dock.upload_button.isEnabled())
+                    self.assertTrue(dock.cancel_upload_button.isHidden())
+                    self.assertTrue(all(not directory.exists() for directory in directories))
 
     def test_registered_upload_wins_cancel_completion_race(self):
-        from qgis.core import QgsTask
+        from geodel.client import GeoDelClient
+        started, release = Event(), Event()
+        self.addCleanup(release.set)
+
+        def registered(*_args):
+            started.set()
+            release.wait(5)
+            return "upload-1"
 
         self.prepare_file_upload()
-        task = QgsTask.fromFunction("Completed upload", lambda _task: None)
-        self.plugin._upload_task = task
-        self.plugin.dock.set_uploading(True)
-        self.plugin.dock.cancel_upload_button.click()
-        self.plugin._upload_finished(
-            task, self.plugin._connection_version, "https://example.com", None, "upload-1",
-        )
+        with patch.object(GeoDelClient, "upload_file", side_effect=registered):
+            self.plugin.dock.upload_button.click()
+            wait_until(started.is_set)
+            self.plugin.dock.cancel_upload_button.click()
+            release.set()
+            wait_until(lambda: self.plugin._upload is None)
         self.assertIn("Uploaded.", self.plugin.dock.status.text())
         self.assertIsNone(self.plugin._selected_path)
         self.assertTrue(self.plugin.dock.cancel_upload_button.isHidden())
 
     def test_unload_during_canceled_transfer_ignores_late_completion(self):
-        from geodel.client import GeoDelClient, UploadCanceled
+        from geodel.client import GeoDelClient
         started, release = Event(), Event()
         self.addCleanup(release.set)
 
-        def transfer(_path, _filename, _organization, _folder, _progress, is_canceled):
+        def transfer(_path, _filename, _organization, _folder, progress, _is_canceled):
+            progress(25)
             started.set()
             release.wait(5)
-            if is_canceled():
-                raise UploadCanceled("Upload canceled")
+            progress(90)
             return "upload-1"
 
         with patch.object(GeoDelClient, "upload_file", side_effect=transfer):
             self.prepare_file_upload()
             self.plugin.dock.upload_button.click()
             wait_until(started.is_set)
-            task = self.plugin._upload_task
+            task = self.plugin._upload._task
             self.plugin.dock.cancel_upload_button.click()
             self.plugin.unload()
             self.assertTrue(task.isCanceled())
+            self.plugin.initGui()
+            self.plugin.dock.upload_name.setText("New upload")
+            self.plugin.dock.progress.setValue(7)
             release.set()
             wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
-            self.plugin.initGui()
+            self.assertEqual(self.plugin.dock.upload_name.text(), "New upload")
+            self.assertEqual(self.plugin.dock.progress.value(), 7)
+            self.assertNotIn("Uploaded.", self.plugin.dock.status.text())
             self.assertTrue(self.plugin.dock.cancel_upload_button.isHidden())
-            self.assertIsNone(self.plugin._upload_task)
+            self.assertIsNone(self.plugin._upload)
 
     def test_queued_signal_from_old_dock_cannot_connect_reloaded_plugin(self):
         self.plugin.initGui()
