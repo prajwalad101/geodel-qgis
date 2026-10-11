@@ -17,7 +17,8 @@ def _load_organizations(task, server_url, api_key, config=DEFAULT_CONFIG):
     if task.isCanceled():
         return None
     organizations = _client(task, server_url, api_key, config).list_organizations()
-    return None if task.isCanceled() else organizations
+    # QGIS omits falsy task results; keep an empty Workspace list distinct from cancellation.
+    return None if task.isCanceled() else (organizations,)
 
 
 def _load_metadata(task, server_url, config=DEFAULT_CONFIG):

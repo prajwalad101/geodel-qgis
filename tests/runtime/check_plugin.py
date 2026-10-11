@@ -99,7 +99,7 @@ class PluginRuntimeTests(unittest.TestCase):
         self.version = self.patches.enter_context(patch.object(
             GeoDelClient, "requires_update", return_value=False,
         ))
-        self.patches.enter_context(patch.object(
+        self.organizations = self.patches.enter_context(patch.object(
             GeoDelClient, "list_organizations",
             return_value=[{"id": "org-1", "name": "Test Workspace"}],
         ))
@@ -139,6 +139,14 @@ class PluginRuntimeTests(unittest.TestCase):
         self.assertTrue(loaded)
         return config.config("password")
 
+    def prepare_connection(self):
+        self.assertTrue(QgsApplication.authManager().setMasterPassword("synthetic-runtime-master-password", True))
+        self.plugin.initGui()
+        self.plugin.action.trigger()
+        self.connect_key("synthetic-key")
+        wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+        return self.plugin.settings.value("GeoDel/authConfigId", "", type=str)
+
     def test_metadata_updates_limits_hints_accessibility_and_timers(self):
         from geodel.config import PluginConfig
         from geodel.plugin import METADATA_REFRESH_MILLISECONDS
@@ -155,7 +163,7 @@ class PluginRuntimeTests(unittest.TestCase):
         self.assertEqual(zone.types.text(), ".json — up to 300 MiB")
         self.assertEqual(zone.accessibleDescription(), zone.types.text())
         self.assertEqual(self.plugin._recent_timer.interval(), 12_000)
-        self.assertEqual(self.plugin._organization_timer.interval(), 9_000)
+        self.assertEqual(self.plugin.dock.findChild(QTimer, "GeoDelConnectionTimer").interval(), 9_000)
         self.assertEqual(self.plugin._metadata_timer.interval(), METADATA_REFRESH_MILLISECONDS)
         self.assertFalse(self.plugin._metadata_timer.isActive())
         self.plugin.action.trigger()
@@ -292,17 +300,16 @@ class PluginRuntimeTests(unittest.TestCase):
         from geodel.client import AuthenticationError, GeoDelClient
         from geodel.layer_export import LayerExport
 
-        self.prepare_file_upload()
+        config_id = self.prepare_connection()
         self.select_project_layers(2)
-        self.plugin._connection_valid = True
-        self.plugin._connection_version = 4
         self.plugin.dock.set_folders([{"id": "original", "name": "Original"}], "original")
         artifacts, destinations = [], []
         original_task = LayerExport.create_task
         def prepare(export, on_finished):
-            self.plugin._connection_version = 5
-            self.plugin._load_api_key.return_value = "synthetic-replacement-key"
-            self.plugin.settings.setValue("GeoDel/authConfigId", "synthetic-replacement-config")
+            if self.read_stored_key(config_id) == "synthetic-key":
+                self.plugin.dock.replace_button.click()
+                self.connect_key("synthetic-replacement-key")
+                wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
             self.plugin.dock.set_folders([{"id": "replacement", "name": "Replacement"}], "replacement")
             return original_task(export, on_finished)
         def upload(client, path, _name, organization, folder, *_args):
@@ -314,8 +321,8 @@ class PluginRuntimeTests(unittest.TestCase):
             self.plugin.dock.upload_button.click()
             wait_until(lambda: self.plugin._upload is None)
         self.assertEqual(destinations, [("synthetic-key", "org-1", "original")])
-        self.assertTrue(self.plugin._connection_valid)
-        self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId"), "synthetic-replacement-config")
+        self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId"), config_id)
+        self.assertEqual(self.read_stored_key(config_id), "synthetic-replacement-key")
         self.assertIs(self.plugin.dock.screens.currentWidget(), self.plugin.dock.main_panel)
         self.assertEqual(len(self.plugin.dock.layers.selectedItems()), 2)
         self.assertFalse(artifacts[0].parent.exists())
@@ -392,6 +399,262 @@ class PluginRuntimeTests(unittest.TestCase):
                 self.assertNotIn(b"synthetic-replacement-key", path.read_bytes())
         self.assertTrue(manager.removeAuthenticationConfig(config_id))
 
+    def test_connecting_feedback_precedes_verification_and_trims_candidate_key(self):
+        from geodel.client import GeoDelClient
+
+        self.assertTrue(QgsApplication.authManager().setMasterPassword("synthetic-runtime-master-password", True))
+        self.plugin.initGui()
+        self.plugin.action.trigger()
+        started, release = Event(), Event()
+        self.addCleanup(release.set)
+        observed = []
+        def verify(client):
+            observed.append(client.api_key)
+            started.set()
+            release.wait(5)
+            return [{"id": "org-1", "name": "Test Workspace"}]
+        with patch.object(GeoDelClient, "list_organizations", verify):
+            dock = self.plugin.dock
+            dock.api_key.setText("  synthetic-first-key  ")
+            dock.connect_button.click()
+            self.assertEqual(dock.setup_status.text(), "Checking this Personal API Key…")
+            self.assertFalse(dock.api_key.isEnabled())
+            self.assertFalse(dock.connect_button.isEnabled())
+            wait_until(started.is_set)
+            release.set()
+            wait_until(lambda: dock.screens.currentWidget() is dock.main_panel)
+        self.assertEqual(observed, ["synthetic-first-key"])
+        config_id = self.plugin.settings.value("GeoDel/authConfigId", "", type=str)
+        self.assertEqual(self.read_stored_key(config_id), "synthetic-first-key")
+
+    def test_rejected_replacement_keeps_saved_key_and_returns_to_uploads(self):
+        from geodel.client import AuthenticationError
+        from geodel.connection import NEW_KEY_REJECTED_MESSAGE
+
+        config_id = self.prepare_connection()
+        dock = self.plugin.dock
+        dock.replace_button.click()
+        self.organizations.side_effect = AuthenticationError("Synthetic rejected key")
+        dock.api_key.setText("synthetic-rejected-key")
+        dock.connect_button.click()
+        wait_until(lambda: dock.setup_status.text() == NEW_KEY_REJECTED_MESSAGE)
+        self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId"), config_id)
+        self.assertEqual(self.read_stored_key(config_id), "synthetic-key")
+        self.assertEqual(dock.organizations.currentData(), "org-1")
+        self.assertFalse(dock.cancel_replacement_button.isHidden())
+        self.assertTrue(dock.connect_button.isEnabled())
+        dock.cancel_replacement_button.click()
+        self.assertIs(dock.screens.currentWidget(), dock.main_panel)
+        self.assertEqual(dock.api_key.text(), "")
+
+    def test_connection_management_refresh_keeps_management_until_return(self):
+        config_id = self.prepare_connection()
+        dock = self.plugin.dock
+        dock.replace_button.click()
+        self.assertEqual(dock.setup_title.text(), "Connection management")
+        # Workflow state survives a rendering change without reading the widget.
+        dock.screens.setCurrentWidget(dock.main_panel)
+        dock.refresh_requested.emit()
+        wait_until(lambda: dock.setup_status.text() == "Connection verified.")
+        self.assertIs(dock.screens.currentWidget(), dock.setup_panel)
+        self.assertFalse(dock.cancel_replacement_button.isHidden())
+        self.assertEqual(self.read_stored_key(config_id), "synthetic-key")
+        dock.cancel_replacement_button.click()
+        self.assertIs(dock.screens.currentWidget(), dock.main_panel)
+
+    def test_failed_or_canceled_saved_checks_preserve_connection_and_view(self):
+        from geodel.client import GeoDelError, ServerUnavailableError
+        from geodel.connection import CONNECTION_FAILED_MESSAGE, SERVER_UNAVAILABLE_MESSAGE
+
+        config_id = self.prepare_connection()
+        dock = self.plugin.dock
+        outcomes = (
+            (ServerUnavailableError("Synthetic unavailable"), SERVER_UNAVAILABLE_MESSAGE),
+            (GeoDelError("Synthetic failure"), CONNECTION_FAILED_MESSAGE),
+            (None, "Connection check was canceled. Try again."),
+        )
+        for managing in (False, True):
+            if managing:
+                dock.replace_button.click()
+            for error, message in outcomes:
+                with self.subTest(managing=managing, error=type(error).__name__):
+                    self.organizations.side_effect = error
+                    self.organizations.return_value = None
+                    dock.refresh_requested.emit()
+                    status = dock.setup_status if managing else dock.status
+                    wait_until(lambda: message in status.text())
+                    self.assertIs(dock.screens.currentWidget(), dock.setup_panel if managing else dock.main_panel)
+                    self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId"), config_id)
+                    self.assertEqual(self.read_stored_key(config_id), "synthetic-key")
+                    self.assertTrue(dock.refresh_button.isEnabled())
+                    if managing:
+                        self.assertFalse(dock.cancel_replacement_button.isHidden())
+
+    def test_saved_key_rejection_removes_encrypted_config_and_requires_reconnection(self):
+        from geodel.auth_compat import unpack_auth_result
+        from geodel.client import AuthenticationError
+        from geodel.connection import SAVED_KEY_REJECTED_MESSAGE
+
+        config_id = self.prepare_connection()
+        self.organizations.side_effect = AuthenticationError("Synthetic expired key")
+        self.plugin.dock.refresh_requested.emit()
+        wait_until(lambda: self.plugin.dock.setup_status.text() == SAVED_KEY_REJECTED_MESSAGE)
+        self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId", ""), "")
+        config = QgsAuthMethodConfig()
+        loaded, _config = unpack_auth_result(
+            QgsApplication.authManager().loadAuthenticationConfig(config_id, config, True), config,
+        )
+        self.assertFalse(loaded)
+        self.assertEqual(self.plugin.dock.organizations.count(), 0)
+        self.assertTrue(self.plugin.dock.cancel_replacement_button.isHidden())
+
+    def test_secure_storage_failure_keeps_candidate_and_existing_connection(self):
+        manager = QgsApplication.authManager()
+        self.assertTrue(manager.setMasterPassword("synthetic-runtime-master-password", True))
+        self.plugin.initGui()
+        self.plugin.action.trigger()
+        for replacing in (False, True):
+            with self.subTest(replacing=replacing):
+                config_id = ""
+                if replacing:
+                    self.connect_key("synthetic-key")
+                    wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+                    config_id = self.plugin.settings.value("GeoDel/authConfigId", "", type=str)
+                    self.plugin.dock.replace_button.click()
+                dock = self.plugin.dock
+                dock.api_key.setText("synthetic-unsaved-key")
+                with patch.object(manager, "storeAuthenticationConfig", return_value=False), \
+                        patch("geodel.connection.QMessageBox.warning") as warning:
+                    dock.connect_button.click()
+                    wait_until(lambda: "could not save it securely" in dock.setup_status.text())
+                    warning.assert_called_once()
+                self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId", ""), config_id)
+                self.assertEqual(dock.api_key.text(), "synthetic-unsaved-key")
+                self.assertTrue(dock.connect_button.isEnabled())
+                self.assertEqual(dock.cancel_replacement_button.isHidden(), not replacing)
+                if replacing:
+                    self.assertEqual(self.read_stored_key(config_id), "synthetic-key")
+
+    def test_declining_authentication_unlock_does_not_store_verified_key(self):
+        self.plugin.initGui()
+        self.plugin.action.trigger()
+        manager = QgsApplication.authManager()
+        dock = self.plugin.dock
+        dock.api_key.setText("synthetic-unsaved-key")
+        with patch.object(manager, "masterPasswordIsSet", return_value=False), \
+                patch.object(manager, "masterPasswordHashInDatabase", return_value=False), \
+                patch.object(manager, "setMasterPassword", return_value=False) as unlock, \
+                patch("geodel.connection.QMessageBox.information") as explanation:
+            dock.connect_button.click()
+            wait_until(lambda: "could not save it securely" in dock.setup_status.text())
+            unlock.assert_called_once_with(True)
+            explanation.assert_called_once()
+        self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId", ""), "")
+        self.assertTrue(self.plugin.settings.value("GeoDel/masterPasswordExplained", False, type=bool))
+        self.assertEqual(dock.api_key.text(), "synthetic-unsaved-key")
+
+    def test_queued_connection_check_times_out_without_running_or_storing_key(self):
+        from geodel.config import DEFAULT_CONFIG
+        from geodel.connection import SERVER_UNAVAILABLE_MESSAGE
+        from qgis.core import QgsTask
+
+        self.plugin.initGui()
+        self.plugin.action.trigger()
+        wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+        self.plugin._connection.set_config(replace(DEFAULT_CONFIG, connection_feedback_timeout_seconds=1))
+        original_task = QgsTask.fromFunction
+        def queued_task(description, *args, **kwargs):
+            task = original_task(description, *args, **kwargs)
+            if description == "Load GeoDel workspaces":
+                task.hold()
+            return task
+        with patch.object(QgsTask, "fromFunction", side_effect=queued_task):
+            self.plugin.dock.api_key.setText("synthetic-queued-key")
+            self.plugin.dock.connect_button.click()
+            wait_until(lambda: self.plugin.dock.setup_status.text() == SERVER_UNAVAILABLE_MESSAGE)
+            wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+        self.organizations.assert_not_called()
+        self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId", ""), "")
+        self.assertTrue(self.plugin.dock.connect_button.isEnabled())
+        self.assertFalse(self.plugin.dock.findChild(QTimer, "GeoDelConnectionTimer").isActive())
+
+    def test_return_cancels_replacement_and_ignores_completion_in_new_management_view(self):
+        config_id = self.prepare_connection()
+        dock = self.plugin.dock
+        started, release = Event(), Event()
+        self.addCleanup(release.set)
+        def verify():
+            started.set()
+            release.wait(5)
+            return [{"id": "org-other", "name": "Other Workspace"}]
+        self.organizations.side_effect = verify
+        dock.replace_button.click()
+        dock.api_key.setText("synthetic-canceled-key")
+        dock.connect_button.click()
+        wait_until(started.is_set)
+        dock.cancel_replacement_button.click()
+        self.assertIs(dock.screens.currentWidget(), dock.main_panel)
+        self.assertFalse(dock.findChild(QTimer, "GeoDelConnectionTimer").isActive())
+        dock.replace_button.click()
+        dock.api_key.setText("synthetic-unsubmitted-key")
+        release.set()
+        wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+        self.assertIs(dock.screens.currentWidget(), dock.setup_panel)
+        self.assertEqual(dock.api_key.text(), "synthetic-unsubmitted-key")
+        self.assertEqual(dock.organizations.currentData(), "org-1")
+        self.assertEqual(self.read_stored_key(config_id), "synthetic-key")
+
+    def test_unload_connection_check_ignores_late_completion_after_reload(self):
+        self.plugin.initGui()
+        self.plugin.action.trigger()
+        started, release = Event(), Event()
+        self.addCleanup(release.set)
+        def verify():
+            started.set()
+            release.wait(5)
+            return [{"id": "org-1", "name": "Test Workspace"}]
+        self.organizations.side_effect = verify
+        self.plugin.dock.api_key.setText("synthetic-canceled-key")
+        self.plugin.dock.connect_button.click()
+        wait_until(started.is_set)
+        self.plugin.unload()
+        flush_deletes()
+        self.plugin.initGui()
+        self.plugin.dock.api_key.setText("synthetic-unsubmitted-key")
+        release.set()
+        wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+        self.assertEqual(self.plugin.settings.value("GeoDel/authConfigId", ""), "")
+        self.assertEqual(self.plugin.dock.api_key.text(), "synthetic-unsubmitted-key")
+        self.assertIs(self.plugin.dock.screens.currentWidget(), self.plugin.dock.setup_panel)
+        self.assertTrue(self.plugin.dock.connect_button.isEnabled())
+
+    def test_replacement_without_workspaces_clears_old_workspace_data(self):
+        from geodel.recent_upload import RecentUpload
+
+        config_id = self.prepare_connection()
+        dock = self.plugin.dock
+        dock.set_recent_uploads([RecentUpload(
+            "roads.geojson", "Ready", False, None, None, None,
+            "https://example.invalid/s/synthetic-token", None, None,
+        )])
+        self.organizations.return_value = []
+        dock.replace_button.click()
+        dock.api_key.setText("synthetic-no-workspaces-key")
+        dock.connect_button.click()
+        wait_until(lambda: dock.setup_title.text() == "Workspace setup required")
+        self.assertEqual(self.read_stored_key(config_id), "synthetic-no-workspaces-key")
+        self.assertEqual(dock.organizations.count(), 0)
+        self.assertEqual(dock.recent_uploads.count(), 0)
+        self.assertFalse(dock.upload_button.isEnabled())
+        self.assertFalse(dock.retry_connection_button.isHidden())
+        self.assertTrue(dock.retry_connection_button.isEnabled())
+        self.plugin.unload()
+        flush_deletes()
+        self.plugin.initGui()
+        self.plugin.action.trigger()
+        wait_until(lambda: self.plugin.dock.setup_title.text() == "Workspace setup required")
+        self.assertEqual(self.read_stored_key(config_id), "synthetic-no-workspaces-key")
+
     def test_unload_cancels_active_task_and_ignores_late_completion_after_reload(self):
         started, release = Event(), Event()
 
@@ -421,14 +684,7 @@ class PluginRuntimeTests(unittest.TestCase):
         self.assertEqual(len(self.iface.toolbar.actions()), 1)
 
     def prepare_file_upload(self):
-        self.plugin.initGui()
-        self.plugin.action.trigger()
-        self.patches.enter_context(patch.object(
-            self.plugin, "_load_api_key", return_value="synthetic-key",
-        ))
-        self.plugin.dock.set_organizations([{"id": "org-1", "name": "Test Workspace"}])
-        self.plugin.dock.show_connected()
-        wait_until(lambda: QgsApplication.taskManager().countActiveTasks() == 0)
+        self.prepare_connection()
         source = Path(os.environ["GEODEL_RUNTIME_ROOT"]) / "roads.geojson"
         source.write_text('{"type":"FeatureCollection","features":[]}')
         self.plugin._choose_file(str(source))
